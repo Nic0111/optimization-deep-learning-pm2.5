@@ -216,3 +216,30 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ODL assignment generated data and experiment artifacts
+data/raw/*
+data/interim/*
+data/processed/*
+artifacts/environment/*
+artifacts/histories/*
+artifacts/models/*
+artifacts/preprocessing/*
+artifacts/tuning/*
+artifacts/run_state/*
+artifacts/runtime_logs/*
+artifacts/training_backups/*
+artifacts/executed_notebooks/*
+outputs/assignment1/figures/*
+outputs/assignment1/tables/*
+outputs/assignment1/logs/*
+outputs/assignment2/figures/*
+outputs/assignment2/tables/*
+outputs/assignment2/logs/*
+tmp/
+.tmp.driveupload/
+
+# Preserve the intended empty folder structure.
+!.gitkeep
+!*/.gitkeep
+!**/.gitkeep
