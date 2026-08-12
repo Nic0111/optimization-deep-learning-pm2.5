@@ -121,7 +121,7 @@ def prediction_frame(
     sequence: StationWindowSequence,
     predictions: np.ndarray,
 ) -> pd.DataFrame:
-    """Align ordered model predictions with targets and naive baselines."""
+    """Align predictions with persistence and true 24-hour daily persistence."""
 
     anchors = sequence.ordered_anchor_indices()
     values = np.asarray(predictions).reshape(-1)
@@ -133,10 +133,16 @@ def prediction_frame(
         ["station", "target_timestamp", "target_pm25", "PM2.5_input_raw"],
     ].copy()
     frame = frame.rename(columns={"target_pm25": "y_true", "PM2.5_input_raw": "persistence"})
-    seasonal_rows = anchors - (sequence.lookback - 1)
-    frame["seasonal_persistence"] = model_table.loc[
-        seasonal_rows, "PM2.5_input_raw"
-    ].to_numpy(dtype=float)
+    daily_timestamps = pd.to_datetime(frame["target_timestamp"]) - pd.Timedelta(hours=24)
+    lookup = model_table.set_index(["station", "timestamp"])["PM2.5_input_raw"]
+    daily_keys = pd.MultiIndex.from_arrays(
+        [frame["station"].to_numpy(), daily_timestamps.to_numpy()],
+        names=["station", "timestamp"],
+    )
+    daily_values = lookup.reindex(daily_keys).to_numpy(dtype=float)
+    if not np.isfinite(daily_values).all():
+        raise ValueError("Daily persistence requires a complete station-level 24-hour history.")
+    frame["daily_persistence"] = daily_values
     frame["y_pred"] = values
     frame["residual"] = frame["y_true"] - frame["y_pred"]
     return frame.reset_index(drop=True)

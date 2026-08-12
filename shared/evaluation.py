@@ -68,6 +68,64 @@ def metrics_by_group(
     return pd.DataFrame(rows)
 
 
+def paired_moving_block_bootstrap(
+    predictions: pd.DataFrame,
+    prediction_a: str,
+    prediction_b: str,
+    *,
+    block_days: int = 7,
+    n_boot: int = 10_000,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Bootstrap paired MAE differences using calendar-day moving blocks.
+
+    Every sampled day retains all stations and hours. Multi-day blocks preserve
+    short-range temporal dependence. A negative difference favours model A.
+    """
+
+    if block_days < 1:
+        raise ValueError("block_days must be at least one.")
+    if n_boot < 1:
+        raise ValueError("n_boot must be at least one.")
+    frame = predictions.copy()
+    frame["date"] = pd.to_datetime(frame["target_timestamp"]).dt.normalize()
+    frame["error_difference"] = (
+        np.abs(frame["y_true"] - frame[prediction_a])
+        - np.abs(frame["y_true"] - frame[prediction_b])
+    )
+    daily = (
+        frame.groupby("date", observed=True)["error_difference"]
+        .agg(error_sum="sum", row_count="size")
+        .sort_index()
+    )
+    day_count = len(daily)
+    if day_count < block_days:
+        raise ValueError("The requested moving block is longer than the benchmark.")
+    error_sums = daily["error_sum"].to_numpy(dtype=float)
+    row_counts = daily["row_count"].to_numpy(dtype=float)
+    starts_available = day_count - block_days + 1
+    blocks_needed = int(np.ceil(day_count / block_days))
+    rng = np.random.default_rng(seed)
+    samples = np.empty(n_boot, dtype=float)
+    for index in range(n_boot):
+        starts = rng.integers(0, starts_available, size=blocks_needed)
+        sampled_days = np.concatenate(
+            [np.arange(start, start + block_days, dtype=int) for start in starts]
+        )[:day_count]
+        samples[index] = error_sums[sampled_days].sum() / row_counts[sampled_days].sum()
+    lower, upper = np.quantile(samples, [0.025, 0.975])
+    return {
+        "mean_mae_difference_a_minus_b": float(frame["error_difference"].mean()),
+        "ci95_lower": float(lower),
+        "ci95_upper": float(upper),
+        "block_length_days": int(block_days),
+        "n_calendar_days": int(day_count),
+        "n_rows": int(len(frame)),
+        "bootstrap_samples": int(n_boot),
+        "seed": int(seed),
+    }
+
+
 def paired_block_bootstrap(
     predictions: pd.DataFrame,
     prediction_a: str,
@@ -75,31 +133,13 @@ def paired_block_bootstrap(
     n_boot: int = 1_000,
     seed: int = 42,
 ) -> dict[str, float]:
-    """Bootstrap paired station-day MAE differences as 24-hour blocks.
+    """Backward-compatible one-calendar-day sensitivity bootstrap."""
 
-    A negative difference means model A has lower MAE than model B.
-    """
-
-    frame = predictions.copy()
-    frame["date"] = pd.to_datetime(frame["target_timestamp"]).dt.date
-    frame["absolute_error_a"] = np.abs(frame["y_true"] - frame[prediction_a])
-    frame["absolute_error_b"] = np.abs(frame["y_true"] - frame[prediction_b])
-    block_difference = (
-        frame.groupby(["station", "date"], observed=True)[["absolute_error_a", "absolute_error_b"]]
-        .mean()
-        .eval("absolute_error_a - absolute_error_b")
-        .to_numpy(dtype=float)
+    return paired_moving_block_bootstrap(
+        predictions,
+        prediction_a,
+        prediction_b,
+        block_days=1,
+        n_boot=n_boot,
+        seed=seed,
     )
-    rng = np.random.default_rng(seed)
-    samples = np.empty(n_boot, dtype=float)
-    for index in range(n_boot):
-        draw = rng.choice(block_difference, size=len(block_difference), replace=True)
-        samples[index] = draw.mean()
-    lower, upper = np.quantile(samples, [0.025, 0.975])
-    return {
-        "mean_mae_difference_a_minus_b": float(block_difference.mean()),
-        "ci95_lower": float(lower),
-        "ci95_upper": float(upper),
-        "n_station_day_blocks": len(block_difference),
-        "bootstrap_samples": int(n_boot),
-    }

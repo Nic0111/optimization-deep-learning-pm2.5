@@ -25,18 +25,23 @@ from .config import (
     ProjectPaths,
 )
 from .data_pipeline import (
+    PreprocessingPolicy,
     create_model_table,
     download_dataset,
     extract_dataset,
+    fit_preprocessor,
+    load_development_data,
+    load_frozen_benchmark,
     load_and_validate_raw,
     missing_summary,
-    save_model_table,
+    partition_frozen_benchmark,
     schema_summary,
+    transform_model_table,
 )
 from .evaluation import (
     add_analysis_groups,
     metrics_by_group,
-    paired_block_bootstrap,
+    paired_moving_block_bootstrap,
     regression_metrics,
 )
 from .plotting import (
@@ -47,14 +52,16 @@ from .plotting import (
     save_figure,
     set_plot_style,
 )
-from .runtime import RunStateStore, RuntimeOptions, tracked_stage, write_json_atomic
+from .runtime import RunStateStore, RuntimeOptions, write_json_atomic
 from .selection import (
     LSTMConfig,
     ROLLING_FOLDS,
     aggregate_validation_results,
     generate_lstm_candidates,
+    selection_audit,
     select_lstm_candidate,
     select_one_standard_error,
+    validate_search_completeness,
 )
 from .sequence_pipeline import build_sequences, prediction_frame
 
@@ -68,6 +75,50 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _write_frame(frame: pd.DataFrame, path: Path, index: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=index)
+
+
+def _selected_preprocessing_path(paths: ProjectPaths, suffix: str) -> Path:
+    return paths.processed / f"selected_preprocessing{suffix}.json"
+
+
+def _rolling_metadata_path(paths: ProjectPaths, suffix: str) -> Path:
+    return paths.processed / f"rolling_validation_metadata{suffix}.json"
+
+
+def _model_input_paths(paths: ProjectPaths, suffix: str) -> tuple[Path, Path, Path, Path]:
+    return (
+        paths.processed / f"model_table{suffix}.parquet",
+        paths.processed / f"feature_metadata{suffix}.json",
+        paths.processed / f"split_metadata{suffix}.json",
+        paths.preprocessing / f"preprocessing{suffix}.joblib",
+    )
+
+
+def _benchmark_input_paths(paths: ProjectPaths, suffix: str) -> tuple[Path, Path]:
+    return (
+        paths.processed / f"frozen_benchmark_model_table{suffix}.parquet",
+        paths.processed / f"frozen_benchmark_split_metadata{suffix}.json",
+    )
+
+
+def _persist_model_inputs(
+    table: pd.DataFrame,
+    artifacts: Any,
+    metadata: dict[str, Any],
+    paths: ProjectPaths,
+    suffix: str,
+) -> tuple[Path, Path, Path, Path]:
+    import joblib
+
+    model_path, feature_path, split_path, preprocessor_path = _model_input_paths(paths, suffix)
+    table.to_parquet(model_path, index=False)
+    joblib.dump(artifacts, preprocessor_path)
+    write_json_atomic(
+        feature_path,
+        {"features": artifacts.feature_columns, "count": len(artifacts.feature_columns)},
+    )
+    write_json_atomic(split_path, metadata)
+    return model_path, feature_path, split_path, preprocessor_path
 
 
 def _smoke_table(model_table: pd.DataFrame, lookback: int) -> pd.DataFrame:
@@ -90,13 +141,14 @@ def _load_model_inputs(
     paths: ProjectPaths,
     splits: tuple[str, ...] | None = None,
 ) -> tuple[pd.DataFrame, list[str], dict[str, Any]]:
-    if not paths.model_table.exists():
+    model_path, feature_path, split_path, _ = _model_input_paths(paths, options.artifact_suffix)
+    if not model_path.exists():
         raise FileNotFoundError("Prepared model data is missing; run the prepare stage first.")
-    model_table = pd.read_parquet(paths.model_table)
+    model_table = pd.read_parquet(model_path)
     model_table["timestamp"] = pd.to_datetime(model_table["timestamp"])
     model_table["target_timestamp"] = pd.to_datetime(model_table["target_timestamp"])
-    feature_columns = _read_json(paths.feature_metadata)["features"]
-    lookback = int(_read_json(paths.split_metadata)["lookback_hours"])
+    feature_columns = _read_json(feature_path)["features"]
+    lookback = int(_read_json(split_path)["lookback_hours"])
     if options.mode == "smoke":
         model_table = _smoke_table(model_table, lookback)
     if splits is None:
@@ -131,6 +183,7 @@ def acquire_stage(
     station_files = extract_dataset(paths, force=False)
     air_quality = load_and_validate_raw(paths, station_files, strict=True)
     air_quality.to_parquet(paths.combined_parquet, index=False)
+    development_rows, benchmark_rows = partition_frozen_benchmark(air_quality, paths)
 
     station_audit = (
         air_quality.groupby("station", observed=True)
@@ -159,11 +212,15 @@ def acquire_stage(
         "archive_bytes": manifest.bytes,
         "source_url": manifest.url,
         "dataset_doi": manifest.doi,
+        "development_rows": development_rows,
+        "frozen_benchmark_rows": benchmark_rows,
         "run_mode": options.mode,
     }
     return summary, [
         paths.source_manifest,
         paths.combined_parquet,
+        paths.development_parquet,
+        paths.frozen_benchmark_parquet,
         paths.assignment1_tables / "station_source_audit.csv",
         paths.assignment1_tables / "raw_schema.csv",
         paths.assignment1_tables / "raw_missing_summary.csv",
@@ -174,14 +231,11 @@ def acquire_stage(
 def prepare_stage(
     options: RuntimeOptions,
     paths: ProjectPaths,
-    _: RunStateStore,
+    store: RunStateStore,
 ) -> tuple[dict[str, Any], list[Path]]:
-    """Produce EDA evidence and leakage-safe train-fitted model inputs."""
+    """Produce development-only EDA and leakage-safe train-fitted model inputs."""
 
-    if not paths.combined_parquet.exists():
-        raise FileNotFoundError("Validated source data is missing; run the acquire stage first.")
-    air_quality = pd.read_parquet(paths.combined_parquet)
-    air_quality["timestamp"] = pd.to_datetime(air_quality["timestamp"])
+    air_quality = load_development_data(paths)
     set_plot_style()
 
     analysis_columns = list(CONTINUOUS_INPUT_COLUMNS)
@@ -311,7 +365,7 @@ def prepare_stage(
     _write_frame(autocorrelation, paths.assignment1_tables / "pm25_autocorrelation.csv")
     plt.figure(figsize=(11, 4))
     sns.lineplot(data=autocorrelation, x="lag_hours", y="mean_station_autocorrelation")
-    plt.axvline(24, color="black", linestyle="--", label="24-hour lookback")
+    plt.axvline(24, color="black", linestyle="--", label="24-hour ablation candidate")
     plt.legend()
     plt.title("Mean station PM2.5 autocorrelation")
     save_figure(paths.assignment1_figures / "pm25_autocorrelation.png")
@@ -339,8 +393,20 @@ def prepare_stage(
     plt.legend()
     save_figure(paths.assignment1_figures / "selected_pollution_episode.png")
 
-    model_table, preprocessing, split_metadata = create_model_table(air_quality, paths)
-    save_model_table(model_table, paths)
+    model_table, preprocessing, split_metadata = create_model_table(
+        air_quality,
+        paths,
+        data_end_exclusive=CONFIG.test_start,
+        persist=False,
+        source_fingerprint=store.source_fingerprint,
+    )
+    model_input_outputs = _persist_model_inputs(
+        model_table,
+        preprocessing,
+        split_metadata,
+        paths,
+        options.artifact_suffix,
+    )
     split_distribution = (
         model_table.loc[model_table["valid_anchor"]]
         .groupby("split", observed=True)["target_pm25"]
@@ -378,6 +444,7 @@ def prepare_stage(
         CONFIG.lookback_hours,
         batch_size=4,
         seed=CONFIG.seed,
+        splits=("train",),
     )["train"]
     x_sample, y_sample = sample_sequence[0]
     if x_sample.shape[1] != CONFIG.lookback_hours or y_sample.shape[1] != 1:
@@ -392,10 +459,7 @@ def prepare_stage(
         "run_mode": options.mode,
     }
     return summary, [
-        paths.model_table,
-        paths.feature_metadata,
-        paths.split_metadata,
-        paths.preprocessor_file,
+        *model_input_outputs,
         paths.assignment1_tables / "descriptive_statistics.csv",
         paths.assignment1_tables / "missing_percent_by_station.csv",
         paths.assignment1_tables / "missing_run_summary.csv",
@@ -417,8 +481,7 @@ def prepare_stage(
 
 
 def _modeling_data(options: RuntimeOptions, paths: ProjectPaths) -> pd.DataFrame:
-    data = pd.read_parquet(paths.combined_parquet)
-    data["timestamp"] = pd.to_datetime(data["timestamp"])
+    data = load_development_data(paths)
     if options.mode == "smoke":
         data = data[data["station"].isin(EXPECTED_STATIONS[:2])].copy()
     return data
@@ -435,6 +498,7 @@ def _fold_inputs(
     lookback: int,
     options: RuntimeOptions,
     paths: ProjectPaths,
+    source_fingerprint: str | None = None,
 ) -> tuple[pd.DataFrame, Any, dict[str, Any], dict[str, Any]]:
     subset = raw_data[raw_data["timestamp"] < pd.Timestamp(fold.validation_end)].copy()
     table, artifacts, metadata = create_model_table(
@@ -447,6 +511,7 @@ def _fold_inputs(
         lookback_hours=lookback,
         forward_fill_limit_hours=fill_limit,
         persist=False,
+        source_fingerprint=source_fingerprint,
     )
     sequences = build_sequences(
         table,
@@ -511,11 +576,20 @@ def _append_progress(path: Path, row: dict[str, Any], keys: list[str]) -> pd.Dat
     return combined
 
 
+def _initial_progress(path: Path, *, resume: bool) -> pd.DataFrame:
+    if not resume:
+        path.unlink(missing_ok=True)
+        return pd.DataFrame()
+    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+
+
 def _already_done(frame: pd.DataFrame, **values: Any) -> bool:
     if frame.empty:
         return False
     mask = pd.Series(True, index=frame.index)
     for column, value in values.items():
+        if column not in frame.columns:
+            return False
         mask &= frame[column].astype(str).eq(str(value))
     return bool(mask.any())
 
@@ -559,7 +633,7 @@ def _train_final_model(
 def baselines_stage(
     options: RuntimeOptions,
     paths: ProjectPaths,
-    _: RunStateStore,
+    store: RunStateStore,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Select preprocessing by rolling validation and fit fair basic models."""
 
@@ -573,15 +647,20 @@ def baselines_stage(
     max_epochs = 1 if options.mode == "smoke" else CONFIG.max_epochs
 
     fill_path = paths.assignment2_tables / f"forward_fill_ablation{suffix}.csv"
-    fill_results = pd.read_csv(fill_path) if fill_path.exists() else pd.DataFrame()
+    fill_results = _initial_progress(fill_path, resume=options.resume)
     fill_candidates: list[int | None] = [24] if options.mode == "smoke" else [6, 24, None]
     for fill_limit in fill_candidates:
         label = "unlimited" if fill_limit is None else str(fill_limit)
         for fold in folds:
-            if _already_done(fill_results, fill_limit=label, fold=fold.name):
+            if _already_done(
+                fill_results,
+                fill_limit=label,
+                fold=fold.name,
+                source_fingerprint=store.source_fingerprint,
+            ):
                 continue
             table, artifacts, _, sequences = _fold_inputs(
-                raw_data, fold, fill_limit, 24, options, paths
+                raw_data, fold, fill_limit, 24, options, paths, store.source_fingerprint
             )
             anchors = sequences["validation"].ordered_anchor_indices()
             set_global_determinism(CONFIG.seed)
@@ -595,7 +674,13 @@ def baselines_stage(
             )
             fill_results = _append_progress(
                 fill_path,
-                {"fill_limit": label, "fold": fold.name, "seed": CONFIG.seed, **result},
+                {
+                    "fill_limit": label,
+                    "fold": fold.name,
+                    "seed": CONFIG.seed,
+                    "source_fingerprint": store.source_fingerprint,
+                    **result,
+                },
                 ["fill_limit", "fold", "seed"],
             )
             keras.backend.clear_session()
@@ -612,14 +697,19 @@ def baselines_stage(
     _write_frame(fill_summary, fill_summary_path)
 
     lookback_path = paths.assignment2_tables / f"lookback_ablation{suffix}.csv"
-    lookback_results = pd.read_csv(lookback_path) if lookback_path.exists() else pd.DataFrame()
+    lookback_results = _initial_progress(lookback_path, resume=options.resume)
     lookback_candidates = [24] if options.mode == "smoke" else [12, 24, 48]
     for lookback in lookback_candidates:
         for fold in folds:
-            if _already_done(lookback_results, lookback=lookback, fold=fold.name):
+            if _already_done(
+                lookback_results,
+                lookback=lookback,
+                fold=fold.name,
+                source_fingerprint=store.source_fingerprint,
+            ):
                 continue
             table, artifacts, _, sequences = _fold_inputs(
-                raw_data, fold, selected_fill, lookback, options, paths
+                raw_data, fold, selected_fill, lookback, options, paths, store.source_fingerprint
             )
             anchors = sequences["validation"].ordered_anchor_indices()
             set_global_determinism(CONFIG.seed)
@@ -633,7 +723,13 @@ def baselines_stage(
             )
             lookback_results = _append_progress(
                 lookback_path,
-                {"lookback": lookback, "fold": fold.name, "seed": CONFIG.seed, **result},
+                {
+                    "lookback": lookback,
+                    "fold": fold.name,
+                    "seed": CONFIG.seed,
+                    "source_fingerprint": store.source_fingerprint,
+                    **result,
+                },
                 ["lookback", "fold", "seed"],
             )
             keras.backend.clear_session()
@@ -646,12 +742,18 @@ def baselines_stage(
     _write_frame(lookback_summary, lookback_summary_path)
 
     rolling_path = paths.assignment2_tables / f"basic_rolling_results{suffix}.csv"
-    rolling_results = pd.read_csv(rolling_path) if rolling_path.exists() else pd.DataFrame()
+    rolling_results = _initial_progress(rolling_path, resume=options.resume)
     persistence_rows: list[dict[str, Any]] = []
     fold_metadata: list[dict[str, Any]] = []
     for fold in folds:
         table, artifacts, metadata, sequences = _fold_inputs(
-            raw_data, fold, selected_fill, selected_lookback, options, paths
+            raw_data,
+            fold,
+            selected_fill,
+            selected_lookback,
+            options,
+            paths,
+            store.source_fingerprint,
         )
         fold_metadata.append(
             {
@@ -669,12 +771,17 @@ def baselines_stage(
             sequences["validation"],
             table.loc[anchors, "PM2.5_input_raw"].to_numpy(),
         )
-        for name in ("persistence", "seasonal_persistence"):
+        for name in ("persistence", "daily_persistence"):
             persistence_rows.append(
                 {"fold": fold.name, "model": name, **regression_metrics(targets, baseline[name])}
             )
         for name in ("lstm", "cnn"):
-            if _already_done(rolling_results, model=name, fold=fold.name):
+            if _already_done(
+                rolling_results,
+                model=name,
+                fold=fold.name,
+                source_fingerprint=store.source_fingerprint,
+            ):
                 continue
             set_global_determinism(CONFIG.seed)
             input_shape = (selected_lookback, len(artifacts.feature_columns))
@@ -688,7 +795,13 @@ def baselines_stage(
             )
             rolling_results = _append_progress(
                 rolling_path,
-                {"model": name, "fold": fold.name, "seed": CONFIG.seed, **result},
+                {
+                    "model": name,
+                    "fold": fold.name,
+                    "seed": CONFIG.seed,
+                    "source_fingerprint": store.source_fingerprint,
+                    **result,
+                },
                 ["model", "fold", "seed"],
             )
             keras.backend.clear_session()
@@ -727,6 +840,7 @@ def baselines_stage(
             "selection_metric": "mean_rolling_validation_mae",
             "run_mode": options.mode,
             "config_hash": options.stable_hash(),
+            "source_fingerprint": store.source_fingerprint,
         },
     )
     selected_payload = {
@@ -735,25 +849,39 @@ def baselines_stage(
         "selection_rule": "lowest mean rolling MAE with one-standard-error simplicity rule",
         "run_mode": options.mode,
         "config_hash": options.stable_hash(),
+        "source_fingerprint": store.source_fingerprint,
     }
-    write_json_atomic(paths.selected_preprocessing, selected_payload)
+    selected_preprocessing_path = _selected_preprocessing_path(paths, suffix)
+    rolling_metadata_path = _rolling_metadata_path(paths, suffix)
+    write_json_atomic(selected_preprocessing_path, selected_payload)
     write_json_atomic(
-        paths.rolling_validation_metadata,
-        {"folds": fold_metadata, "frozen_test_start": CONFIG.test_start},
+        rolling_metadata_path,
+        {
+            "folds": fold_metadata,
+            "frozen_test_start": CONFIG.test_start,
+            "source_fingerprint": store.source_fingerprint,
+        },
     )
 
-    final_table, final_artifacts, _, = create_model_table(
+    final_table, final_artifacts, final_metadata = create_model_table(
         raw_data,
         paths,
         train_start=CONFIG.train_start,
         validation_start=CONFIG.test_start,
         test_start=CONFIG.test_start,
-        data_end_exclusive=CONFIG.data_end_exclusive,
+        data_end_exclusive=CONFIG.test_start,
         lookback_hours=selected_lookback,
         forward_fill_limit_hours=selected_fill,
-        persist=True,
+        persist=False,
+        source_fingerprint=store.source_fingerprint,
     )
-    save_model_table(final_table, paths)
+    final_model_input_outputs = _persist_model_inputs(
+        final_table,
+        final_artifacts,
+        final_metadata,
+        paths,
+        suffix,
+    )
     final_sequences = build_sequences(
         final_table,
         final_artifacts.feature_columns,
@@ -793,12 +921,9 @@ def baselines_stage(
         baseline_metrics_path,
         comparison_path,
         selection_path,
-        paths.selected_preprocessing,
-        paths.rolling_validation_metadata,
-        paths.model_table,
-        paths.feature_metadata,
-        paths.split_metadata,
-        paths.preprocessor_file,
+        selected_preprocessing_path,
+        rolling_metadata_path,
+        *final_model_input_outputs,
         paths.models / f"basic_lstm{suffix}.keras",
         paths.models / f"basic_cnn{suffix}.keras",
         paths.histories / f"basic_lstm{suffix}_epochs.csv",
@@ -844,7 +969,7 @@ def _build_candidate_model(
 def tune_stage(
     options: RuntimeOptions,
     paths: ProjectPaths,
-    _: RunStateStore,
+    store: RunStateStore,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Run repeated-seed stratified random search over rolling folds."""
 
@@ -854,7 +979,10 @@ def tune_stage(
     from .models import set_global_determinism
 
     suffix = options.artifact_suffix
-    selected_preprocessing = _read_json(paths.selected_preprocessing)
+    selected_preprocessing_path = _selected_preprocessing_path(paths, suffix)
+    selected_preprocessing = _read_json(selected_preprocessing_path)
+    if selected_preprocessing.get("source_fingerprint") != store.source_fingerprint:
+        raise RuntimeError("Selected preprocessing belongs to different methodology source.")
     selected_lookback = int(selected_preprocessing["lookback_hours"])
     selected_fill = selected_preprocessing["forward_fill_limit_hours"]
     raw_data = _modeling_data(options, paths)
@@ -864,10 +992,16 @@ def tune_stage(
     folds = _folds(options)
     max_epochs = 1 if options.mode == "smoke" else CONFIG.max_epochs
     search_path = paths.assignment2_tables / f"random_search_rolling_results{suffix}.csv"
-    results = pd.read_csv(search_path) if search_path.exists() else pd.DataFrame()
+    results = _initial_progress(search_path, resume=options.resume)
     for fold in folds:
         table, artifacts, _, sequences = _fold_inputs(
-            raw_data, fold, selected_fill, selected_lookback, options, paths
+            raw_data,
+            fold,
+            selected_fill,
+            selected_lookback,
+            options,
+            paths,
+            store.source_fingerprint,
         )
         anchors = sequences["validation"].ordered_anchor_indices()
         targets = table.loc[anchors, "target_pm25"].to_numpy()
@@ -878,6 +1012,7 @@ def tune_stage(
                     candidate_id=candidate.candidate_id,
                     fold=fold.name,
                     seed=seed,
+                    source_fingerprint=store.source_fingerprint,
                 ):
                     continue
                 set_global_determinism(seed)
@@ -899,15 +1034,24 @@ def tune_stage(
                         **candidate.to_dict(),
                         "fold": fold.name,
                         "seed": seed,
+                        "source_fingerprint": store.source_fingerprint,
                         **fit,
                     },
                     ["candidate_id", "fold", "seed"],
                 )
                 keras.backend.clear_session()
+    results = validate_search_completeness(
+        results,
+        [candidate.candidate_id for candidate in candidates],
+        [fold.name for fold in folds],
+        seeds,
+        source_fingerprint=store.source_fingerprint,
+    )
     summary = aggregate_validation_results(results)
     summary_path = paths.assignment2_tables / f"random_search_summary{suffix}.csv"
     _write_frame(summary, summary_path)
     selected_row = select_lstm_candidate(summary)
+    audit = selection_audit(summary, selected_row)
     selected_candidate = next(
         candidate for candidate in candidates if candidate.candidate_id == selected_row["candidate_id"]
     )
@@ -924,13 +1068,16 @@ def tune_stage(
             "selection_rule": "one-standard-error; parameters, layers, direct formulation",
             "run_mode": options.mode,
             "config_hash": options.stable_hash(),
+            "source_fingerprint": store.source_fingerprint,
+            "selection_audit": audit,
         },
     )
 
     model_table, feature_columns, sequences = _load_model_inputs(
         options, paths, splits=("train",)
     )
-    artifacts = joblib.load(paths.preprocessor_file)
+    _, _, _, preprocessor_path = _model_input_paths(paths, suffix)
+    artifacts = joblib.load(preprocessor_path)
     set_global_determinism(CONFIG.seed)
     model = _build_candidate_model(
         selected_candidate,
@@ -960,8 +1107,11 @@ def tune_stage(
             "validation_standard_error": float(selected_row["se_mae"]),
             "final_checkpoint": str(final_checkpoint),
             "frozen_test_used_for_selection": False,
+            "selection_locked_before_benchmark": True,
             "run_mode": options.mode,
             "config_hash": options.stable_hash(),
+            "source_fingerprint": store.source_fingerprint,
+            "selection_audit": audit,
         },
     )
     outputs = [search_path, summary_path, best_path, final_checkpoint, final_history, final_selection_path]
@@ -981,16 +1131,17 @@ def tune_stage(
 def evaluate_stage(
     options: RuntimeOptions,
     paths: ProjectPaths,
-    _: RunStateStore,
+    store: RunStateStore,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Evaluate frozen models on the previously inspected chronological benchmark."""
 
+    import joblib
     from tensorflow import keras
 
-    # Import registers the custom residual layer before loading a residual model.
-    from .models import PersistenceResidual
+    # Import registers custom objects before loading any saved model.
+    from .models import PersistenceResidual, SerializableHuber
 
-    del PersistenceResidual
+    del PersistenceResidual, SerializableHuber
 
     suffix = options.artifact_suffix
     required = [
@@ -1002,13 +1153,50 @@ def evaluate_stage(
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise FileNotFoundError(f"Required trained artifacts are missing: {missing}")
-    model_table, feature_columns, sequences = _load_model_inputs(
-        options, paths, splits=("test",)
-    )
-    del feature_columns
-    final_selection = _read_json(paths.models / f"final_model_selection{suffix}.json")
+    final_selection_path = paths.models / f"final_model_selection{suffix}.json"
+    final_selection = _read_json(final_selection_path)
     if final_selection.get("run_mode") != options.mode:
         raise RuntimeError("The tuned model was produced in a different run mode.")
+    if final_selection.get("source_fingerprint") != store.source_fingerprint:
+        raise RuntimeError("The tuned model belongs to different methodology source.")
+    development = load_development_data(paths)
+    benchmark = load_frozen_benchmark(
+        paths,
+        final_selection_path,
+        expected_source_fingerprint=store.source_fingerprint,
+    )
+    if options.mode == "smoke":
+        stations = EXPECTED_STATIONS[:2]
+        development = development.loc[development["station"].isin(stations)].copy()
+        benchmark = benchmark.loc[benchmark["station"].isin(stations)].copy()
+    raw_evaluation = pd.concat([development, benchmark], ignore_index=True)
+    _, _, _, preprocessor_path = _model_input_paths(paths, suffix)
+    artifacts = joblib.load(preprocessor_path)
+    if artifacts.source_fingerprint != store.source_fingerprint:
+        raise RuntimeError("The final preprocessor belongs to different methodology source.")
+    selected_preprocessing = _read_json(_selected_preprocessing_path(paths, suffix))
+    selected_lookback = int(selected_preprocessing["lookback_hours"])
+    policy = PreprocessingPolicy(
+        train_start=CONFIG.train_start,
+        fit_end_exclusive=CONFIG.test_start,
+        validation_start=CONFIG.test_start,
+        test_start=CONFIG.test_start,
+        data_end_exclusive=CONFIG.data_end_exclusive,
+        lookback_hours=selected_lookback,
+        forward_fill_limit_hours=selected_preprocessing["forward_fill_limit_hours"],
+    )
+    model_table, benchmark_metadata = transform_model_table(raw_evaluation, artifacts, policy)
+    benchmark_model_path, benchmark_metadata_path = _benchmark_input_paths(paths, suffix)
+    model_table.to_parquet(benchmark_model_path, index=False)
+    write_json_atomic(benchmark_metadata_path, benchmark_metadata)
+    sequences = build_sequences(
+        model_table,
+        artifacts.feature_columns,
+        selected_lookback,
+        options.batch_size,
+        CONFIG.seed,
+        splits=("test",),
+    )
     set_plot_style()
 
     models = {
@@ -1038,12 +1226,20 @@ def evaluate_stage(
     base_frame = base_frame.rename(columns={"y_pred": "tuned_final"})
     base_frame["basic_lstm"] = prediction_values["basic_lstm"]
     base_frame["basic_cnn"] = prediction_values["basic_cnn"]
+    if base_frame.duplicated(["station", "target_timestamp"]).any():
+        raise RuntimeError("Frozen benchmark predictions contain duplicate station-target rows.")
+    model_prediction_columns = ["basic_lstm", "basic_cnn", "tuned_final"]
+    prediction_matrix = base_frame[model_prediction_columns].to_numpy(dtype=float)
+    if not np.isfinite(prediction_matrix).all() or (prediction_matrix < 0).any():
+        raise RuntimeError("Model predictions must be finite and non-negative.")
+    if options.mode == "full" and len(base_frame) != 59_917:
+        raise RuntimeError(f"Expected 59,917 common benchmark rows, found {len(base_frame):,}.")
     predictions_path = paths.assignment2_tables / f"final_test_predictions{suffix}.parquet"
     base_frame.to_parquet(predictions_path, index=False)
 
     prediction_columns = [
         "persistence",
-        "seasonal_persistence",
+        "daily_persistence",
         "basic_lstm",
         "basic_cnn",
         "tuned_final",
@@ -1093,20 +1289,24 @@ def evaluate_stage(
         [
             {
                 "comparison": f"tuned_final_vs_{comparison_model}",
-                **paired_block_bootstrap(
+                "analysis": "official" if block_days == 7 else "sensitivity",
+                **paired_moving_block_bootstrap(
                     base_frame,
                     "tuned_final",
                     comparison_model,
-                    n_boot=(100 if options.mode == "smoke" else 1_000),
+                    block_days=block_days,
+                    n_boot=(100 if options.mode == "smoke" else 10_000),
                     seed=CONFIG.seed,
                 ),
             }
             for comparison_model in ("basic_lstm", "basic_cnn", "persistence")
+            for block_days in (1, 7)
         ]
     )
+    bootstrap_path = paths.assignment2_tables / f"paired_moving_block_bootstrap{suffix}.csv"
     _write_frame(
         bootstrap_results,
-        paths.assignment2_tables / f"paired_block_bootstrap{suffix}.csv",
+        bootstrap_path,
     )
 
     tuned_grouped = grouped_frame.assign(y_pred=grouped_frame["tuned_final"])
@@ -1167,6 +1367,7 @@ def evaluate_stage(
     improvement = (persistence["mae"] - tuned["mae"]) / persistence["mae"] * 100
     basic_bootstrap = bootstrap_results.loc[
         bootstrap_results["comparison"].eq("tuned_final_vs_basic_lstm")
+        & bootstrap_results["block_length_days"].eq(7)
     ].iloc[0]
     significant = bool(float(basic_bootstrap["ci95_upper"]) < 0)
     claim_path = paths.assignment2_tables / f"optimization_claim{suffix}.json"
@@ -1174,7 +1375,10 @@ def evaluate_stage(
         claim_path,
         {
             "statistically_superior_to_basic_lstm": significant,
-            "rule": "claim superiority only when the paired block-bootstrap CI is below zero",
+            "rule": "claim superiority only when the paired seven-day moving-block CI is below zero",
+            "official_block_length_days": 7,
+            "sensitivity_block_length_days": 1,
+            "bootstrap_samples": int(basic_bootstrap["bootstrap_samples"]),
             "test_description": "frozen chronological benchmark previously inspected",
             "test_used_for_model_selection": False,
         },
@@ -1196,9 +1400,11 @@ def evaluate_stage(
         paths.assignment2_tables / f"final_metrics_by_station{suffix}.csv",
         paths.assignment2_tables / f"final_metrics_by_season{suffix}.csv",
         paths.assignment2_tables / f"final_metrics_by_pollution_band{suffix}.csv",
-        paths.assignment2_tables / f"paired_block_bootstrap{suffix}.csv",
+        bootstrap_path,
         residual_path,
         claim_path,
+        benchmark_model_path,
+        benchmark_metadata_path,
         paths.assignment2_figures / f"final_actual_vs_predicted{suffix}.png",
         paths.assignment2_figures / f"final_station_mae{suffix}.png",
         paths.assignment2_figures / f"final_example_week{suffix}.png",
@@ -1235,17 +1441,17 @@ def run_stage(
             "notebook rendering is not allowed to start expensive work."
         )
     function = STAGE_FUNCTIONS[stage]
-    expected_summary: dict[str, Any]
-    outputs: list[Path]
-    # The function determines its output contract after resolving the run suffix.
-    with tracked_stage(store, stage, outputs=[]) as tracked_summary:
-        expected_summary, outputs = function(options, paths, store)
-        tracked_summary.update(expected_summary)
-    # Replace the empty output list written by the context manager with the real contract.
-    state = store.load()
-    state["stages"][stage]["outputs"] = [str(path) for path in outputs]
-    store.save(state)
-    return expected_summary
+    store.begin(stage)
+    try:
+        summary, outputs = function(options, paths, store)
+        missing_outputs = [str(path) for path in outputs if not path.exists()]
+        if missing_outputs:
+            raise RuntimeError(f"Stage {stage!r} did not produce declared outputs: {missing_outputs}")
+        store.complete(stage, summary=summary, outputs=outputs)
+        return summary
+    except BaseException as error:
+        store.fail(stage, error)
+        raise
 
 
 def run_pipeline(

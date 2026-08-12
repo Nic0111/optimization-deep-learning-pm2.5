@@ -240,9 +240,10 @@ def build_eda_notebook() -> None:
             """
             ## Temporal and feature relationships
 
-            Hourly/seasonal behaviour and autocorrelation justify cyclical features and the
-            24-hour sequence length. Correlation and sampled scatter plots provide complementary
-            evidence about contemporaneous predictors.
+            Hourly/seasonal behaviour and autocorrelation justify cyclical features and testing
+            12-, 24-, and 48-hour lookbacks. The final lookback is selected only by rolling
+            validation; correlation and sampled scatter plots provide complementary evidence
+            about contemporaneous predictors.
             """
         ),
         code(
@@ -277,12 +278,16 @@ def build_eda_notebook() -> None:
         ),
         code(
             """
-            feature_metadata = json.loads(PATHS.feature_metadata.read_text(encoding="utf-8"))
-            split_metadata = json.loads(PATHS.split_metadata.read_text(encoding="utf-8"))
+            suffix = OPTIONS.artifact_suffix
+            feature_metadata = json.loads(
+                (PATHS.processed / f"feature_metadata{suffix}.json").read_text(encoding="utf-8")
+            )
+            split_metadata = json.loads(
+                (PATHS.processed / f"split_metadata{suffix}.json").read_text(encoding="utf-8")
+            )
             split_distribution = pd.read_csv(
                 PATHS.assignment1_tables / "target_distribution_by_split.csv", index_col=0
             )
-            suffix = OPTIONS.artifact_suffix
             fill_ablation = pd.read_csv(
                 PATHS.assignment2_tables / f"forward_fill_ablation_summary{suffix}.csv"
             )
@@ -315,11 +320,11 @@ def build_baselines_notebook() -> None:
             """
             ## Baseline forecasts
 
-            **Decision.** Compare neural networks with persistence and matched seasonal
+            **Decision.** Compare neural networks with lag-1 persistence and true 24-hour daily
             persistence. **Alternatives.** Reporting neural models alone cannot show whether they
-            beat the strong lag-1 autocorrelation. **Evidence.** The EDA reports lag-1 correlation
-            near 0.97. **Trade-off.** Naive baselines are intentionally simple, but provide the
-            minimum credible forecasting reference.
+            beat strong short-lag autocorrelation or daily recurrence. **Evidence.** The EDA
+            reports strong lag-1 and daily autocorrelation. **Trade-off.** Naive baselines are
+            intentionally simple, but provide the minimum credible forecasting reference.
             """
         ),
         code(
@@ -416,7 +421,8 @@ def build_tuning_notebook() -> None:
             """
             ## Final validation selection and fixed official model
 
-            **Decision.** Apply the one-standard-error rule, preferring fewer parameters, fewer
+            **Decision.** Average seeds within each fold, estimate standard error across the three
+            future folds, then apply the one-standard-error rule, preferring fewer parameters, fewer
             layers, then a direct formulation when performance is practically tied. The selected
             configuration is trained once with seed 42 on all pre-test data for the median
             validation-derived epoch budget. Huber loss limits the influence of extreme spikes
@@ -504,15 +510,16 @@ def build_evaluation_notebook() -> None:
             """
             ## Temporal uncertainty and diagnostic plots
 
-            Paired station-day block bootstrap intervals preserve more temporal dependence than
-            resampling independent hours. Diagnostic plots reveal bias, extremes, and time-local
-            behaviour.
+            Paired moving-block intervals resample complete calendar days, retaining every station
+            within a day. One-day intervals are a sensitivity check; seven-day blocks are the
+            official superiority test because they preserve short-range temporal dependence.
+            Diagnostic plots reveal bias, extremes, and time-local behaviour.
             """
         ),
         code(
             """
             bootstrap = pd.read_csv(
-                PATHS.assignment2_tables / f"paired_block_bootstrap{suffix}.csv"
+                PATHS.assignment2_tables / f"paired_moving_block_bootstrap{suffix}.csv"
             )
             display(bootstrap)
             optimization_claim = json.loads(

@@ -60,7 +60,9 @@ from shared.runtime import (
     GPUMonitor,
     RunStateStore,
     RuntimeOptions,
+    archive_existing_run,
     run_preflight,
+    source_fingerprint,
     utc_now,
     write_json_atomic,
 )
@@ -193,6 +195,10 @@ def command_preflight(args: argparse.Namespace) -> int:
 
 def command_run(args: argparse.Namespace) -> int:
     requested = _options(args)
+    if not requested.resume:
+        archive_path = archive_existing_run(PATHS, requested.mode)
+        if archive_path is not None:
+            print(f"Archived previous compact run evidence to: {archive_path}")
     with pipeline_log(requested.mode) as log_path:
         pipeline_started = time.perf_counter()
         resolved, environment = run_preflight(requested, probe_batch=not args.no_batch_probe)
@@ -238,7 +244,13 @@ def command_status(args: argparse.Namespace) -> int:
 def _smoke_is_complete() -> bool:
     state = _load_state("smoke")
     required = ("acquire", "prepare", "baselines", "tune", "evaluate", "render")
-    return all(state.get("stages", {}).get(stage, {}).get("status") == "complete" for stage in required)
+    return (
+        state.get("source_fingerprint") == source_fingerprint(ROOT)
+        and all(
+            state.get("stages", {}).get(stage, {}).get("status") == "complete"
+            for stage in required
+        )
+    )
 
 
 def command_start(args: argparse.Namespace) -> int:
@@ -275,6 +287,8 @@ def command_start(args: argparse.Namespace) -> int:
         str(args.batch_size),
         "--render",
     ]
+    if args.no_resume:
+        command.append("--no-resume")
     subprocess.check_call(["tmux", "new-session", "-d", "-s", session, shlex.join(command)])
     print(f"Started persistent session: {session}")
     print(f"Check progress with: {sys.executable} scripts/odl.py status --mode {args.mode}")
@@ -340,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     start = subparsers.add_parser("start", help="Start a persistent WSL training session.")
     add_runtime_arguments(start)
     start.add_argument("--approved-after-smoke", action="store_true")
+    start.add_argument("--no-resume", action="store_true")
     start.set_defaults(handler=command_start)
 
     status = subparsers.add_parser("status", help="Print machine-readable run state.")

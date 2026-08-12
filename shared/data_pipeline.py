@@ -53,6 +53,21 @@ class PreprocessingArtifacts:
     forward_fill_limit_hours: int | None
     fit_start: str
     fit_end_exclusive: str
+    methodology_version: str = CONFIG.methodology_version
+    source_fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class PreprocessingPolicy:
+    """All temporal choices needed to fit and apply preprocessing safely."""
+
+    train_start: str = CONFIG.train_start
+    fit_end_exclusive: str = CONFIG.validation_start
+    validation_start: str = CONFIG.validation_start
+    test_start: str = CONFIG.test_start
+    data_end_exclusive: str = CONFIG.data_end_exclusive
+    lookback_hours: int = CONFIG.lookback_hours
+    forward_fill_limit_hours: int | None = CONFIG.forward_fill_limit_hours
 
 
 COMPASS_DEGREES = {
@@ -288,6 +303,201 @@ def assign_split(
     return result
 
 
+def _ordered_copy(raw_data: pd.DataFrame) -> pd.DataFrame:
+    data = raw_data.sort_values(["station", "timestamp"], kind="stable").reset_index(drop=True).copy()
+    data["timestamp"] = pd.to_datetime(data["timestamp"])
+    unknown = set(data["station"].dropna().unique()) - set(EXPECTED_STATIONS)
+    if unknown:
+        raise ValueError(f"Unknown monitoring stations: {sorted(unknown)}")
+    return data
+
+
+def _feature_contract() -> tuple[list[str], list[str], list[str]]:
+    scaled = [f"z__{column}" for column in CONTINUOUS_INPUT_COLUMNS]
+    missing = [f"missing__{column}" for column in CONTINUOUS_INPUT_COLUMNS]
+    temporal = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
+    wind = ["wind_sin", "wind_cos", "wind_missing"]
+    stations = [f"station__{station}" for station in EXPECTED_STATIONS]
+    return scaled, stations, scaled + missing + temporal + wind + stations
+
+
+def _causal_fill(
+    data: pd.DataFrame,
+    *,
+    fill_limit: int | None,
+    station_medians: dict[str, dict[str, float]],
+    global_medians: dict[str, float],
+) -> pd.DataFrame:
+    result = data.copy()
+    continuous = list(CONTINUOUS_INPUT_COLUMNS)
+    result[continuous] = result.groupby("station", sort=False, observed=True)[continuous].ffill(
+        limit=fill_limit
+    )
+    for station, indices in result.groupby("station", sort=False, observed=True).groups.items():
+        medians = station_medians.get(str(station), global_medians)
+        result.loc[indices, continuous] = result.loc[indices, continuous].fillna(medians)
+    result[continuous] = result[continuous].fillna(global_medians)
+    return result
+
+
+def fit_preprocessor(
+    training_data: pd.DataFrame,
+    policy: PreprocessingPolicy,
+    *,
+    source_fingerprint: str | None = None,
+) -> PreprocessingArtifacts:
+    """Fit every learned preprocessing value using only the declared fit period."""
+
+    data = _ordered_copy(training_data)
+    fit_mask = (
+        (data["timestamp"] >= pd.Timestamp(policy.train_start))
+        & (data["timestamp"] < pd.Timestamp(policy.fit_end_exclusive))
+    )
+    if not fit_mask.any():
+        raise ValueError("The preprocessing fit period contains no rows.")
+    fit_data = data.loc[fit_mask].copy()
+    continuous = list(CONTINUOUS_INPUT_COLUMNS)
+    fit_data[continuous] = fit_data.groupby("station", sort=False, observed=True)[continuous].ffill(
+        limit=policy.forward_fill_limit_hours
+    )
+    station_frame = fit_data.groupby("station", observed=True)[continuous].median()
+    global_series = fit_data[continuous].median()
+    if global_series.isna().any():
+        missing = global_series.index[global_series.isna()].tolist()
+        raise ValueError(f"Training data cannot provide fallback medians for: {missing}")
+    global_medians = {column: float(global_series[column]) for column in continuous}
+    station_medians: dict[str, dict[str, float]] = {}
+    for station in fit_data["station"].dropna().unique():
+        medians = station_frame.loc[station].fillna(global_series)
+        station_medians[str(station)] = {column: float(medians[column]) for column in continuous}
+    imputed_fit = _causal_fill(
+        fit_data,
+        fill_limit=policy.forward_fill_limit_hours,
+        station_medians=station_medians,
+        global_medians=global_medians,
+    )
+    scaler = StandardScaler().fit(imputed_fit[continuous])
+    scaled_columns, station_columns, feature_columns = _feature_contract()
+    return PreprocessingArtifacts(
+        scaler=scaler,
+        continuous_columns=continuous,
+        scaled_columns=scaled_columns,
+        feature_columns=feature_columns,
+        station_medians=station_medians,
+        global_medians=global_medians,
+        station_columns=station_columns,
+        forward_fill_limit_hours=policy.forward_fill_limit_hours,
+        fit_start=policy.train_start,
+        fit_end_exclusive=policy.fit_end_exclusive,
+        source_fingerprint=source_fingerprint,
+    )
+
+
+def transform_model_table(
+    raw_data: pd.DataFrame,
+    artifacts: PreprocessingArtifacts,
+    policy: PreprocessingPolicy,
+) -> tuple[pd.DataFrame, dict]:
+    """Apply a fitted preprocessor and construct station-safe forecast anchors."""
+
+    if artifacts.methodology_version != CONFIG.methodology_version:
+        raise RuntimeError("The fitted preprocessor belongs to a different methodology version.")
+    data = _ordered_copy(raw_data)
+    data["PM2.5_target_original"] = data["PM2.5"]
+    for column in CONTINUOUS_INPUT_COLUMNS:
+        data[f"missing__{column}"] = data[column].isna().astype("float32")
+    data = _causal_fill(
+        data,
+        fill_limit=artifacts.forward_fill_limit_hours,
+        station_medians=artifacts.station_medians,
+        global_medians=artifacts.global_medians,
+    )
+    data["PM2.5_input_raw"] = data["PM2.5"]
+
+    wind_missing = data["wd"].isna() | ~data["wd"].isin(COMPASS_DEGREES)
+    wind_radians = np.deg2rad(data["wd"].map(COMPASS_DEGREES).fillna(0.0).astype(float))
+    data["wind_sin"] = np.sin(wind_radians).astype("float32")
+    data["wind_cos"] = np.cos(wind_radians).astype("float32")
+    data["wind_missing"] = wind_missing.astype("float32")
+    data["hour_sin"] = np.sin(2 * np.pi * data["hour"] / 24.0).astype("float32")
+    data["hour_cos"] = np.cos(2 * np.pi * data["hour"] / 24.0).astype("float32")
+    day_of_year = data["timestamp"].dt.dayofyear
+    days_in_year = np.where(data["timestamp"].dt.is_leap_year, 366.0, 365.0)
+    data["doy_sin"] = np.sin(2 * np.pi * day_of_year / days_in_year).astype("float32")
+    data["doy_cos"] = np.cos(2 * np.pi * day_of_year / days_in_year).astype("float32")
+    for station, column in zip(EXPECTED_STATIONS, artifacts.station_columns, strict=True):
+        data[column] = data["station"].eq(station).astype("float32")
+    data[artifacts.scaled_columns] = artifacts.scaler.transform(
+        data[artifacts.continuous_columns]
+    ).astype("float32")
+
+    data["target_pm25"] = data.groupby("station", sort=False, observed=True)[
+        "PM2.5_target_original"
+    ].shift(-CONFIG.forecast_horizon)
+    data["target_timestamp"] = data.groupby("station", sort=False, observed=True)["timestamp"].shift(
+        -CONFIG.forecast_horizon
+    )
+    data["split"] = assign_split(
+        data["target_timestamp"],
+        train_start=policy.train_start,
+        validation_start=policy.validation_start,
+        test_start=policy.test_start,
+        data_end_exclusive=policy.data_end_exclusive,
+    )
+    data["station_code"] = pd.Categorical(
+        data["station"], categories=EXPECTED_STATIONS, ordered=True
+    ).codes.astype("int16")
+    anchors = np.arange(len(data))
+    starts = anchors - (policy.lookback_hours - 1)
+    valid_start = starts >= 0
+    safe_starts = np.maximum(starts, 0)
+    station_codes = data["station_code"].to_numpy()
+    timestamps = data["timestamp"].to_numpy(dtype="datetime64[h]")
+    same_station = station_codes[safe_starts] == station_codes
+    elapsed = (timestamps - timestamps[safe_starts]).astype("timedelta64[h]").astype(int)
+    data["valid_anchor"] = (
+        valid_start
+        & same_station
+        & (elapsed == policy.lookback_hours - 1)
+        & data["target_pm25"].notna().to_numpy()
+        & data["split"].notna().to_numpy()
+    )
+    if data[artifacts.feature_columns].isna().any().any():
+        raise ValueError("Model features contain missing values after preprocessing.")
+    if not np.isfinite(data[artifacts.feature_columns].to_numpy(dtype="float32")).all():
+        raise ValueError("Model features contain non-finite values.")
+
+    split_counts = (
+        data.loc[data["valid_anchor"]]
+        .groupby("split", observed=True)
+        .size()
+        .reindex(["train", "validation", "test"], fill_value=0)
+        .astype(int)
+        .to_dict()
+    )
+    metadata = {
+        "methodology_version": CONFIG.methodology_version,
+        "source_fingerprint": artifacts.source_fingerprint,
+        "lookback_hours": policy.lookback_hours,
+        "forward_fill_limit_hours": artifacts.forward_fill_limit_hours,
+        "forecast_horizon": CONFIG.forecast_horizon,
+        "feature_count": len(artifacts.feature_columns),
+        "features": artifacts.feature_columns,
+        "split_counts": split_counts,
+        "split_boundaries": {
+            "train_start": policy.train_start,
+            "validation_start": policy.validation_start,
+            "test_start": policy.test_start,
+            "data_end_exclusive": policy.data_end_exclusive,
+        },
+        "preprocessing_fit": {
+            "start": artifacts.fit_start,
+            "end_exclusive": artifacts.fit_end_exclusive,
+        },
+    }
+    return data, metadata
+
+
 def create_model_table(
     raw_data: pd.DataFrame,
     paths: ProjectPaths,
@@ -299,167 +509,80 @@ def create_model_table(
     lookback_hours: int = CONFIG.lookback_hours,
     forward_fill_limit_hours: int | None = CONFIG.forward_fill_limit_hours,
     persist: bool = True,
+    source_fingerprint: str | None = None,
 ) -> tuple[pd.DataFrame, PreprocessingArtifacts, dict]:
-    """Create the causal, train-fitted feature table used by both neural models."""
+    """Compatibility interface that fits then applies the deep preprocessing module."""
 
-    data = raw_data.sort_values(["station", "timestamp"], kind="stable").reset_index(drop=True).copy()
-    data["PM2.5_target_original"] = data["PM2.5"]
-    data["PM2.5_input_raw"] = data["PM2.5"]
-
-    for column in CONTINUOUS_INPUT_COLUMNS:
-        data[f"missing__{column}"] = data[column].isna().astype("float32")
-
-    # Forward filling is causal: each value can depend only on earlier rows from
-    # the same monitoring station.
-    data[list(CONTINUOUS_INPUT_COLUMNS)] = data.groupby(
-        "station", sort=False, observed=True
-    )[list(CONTINUOUS_INPUT_COLUMNS)].ffill(limit=forward_fill_limit_hours)
-
-    train_row_mask = (
-        (data["timestamp"] >= pd.Timestamp(train_start))
-        & (data["timestamp"] < pd.Timestamp(validation_start))
-    )
-    if not train_row_mask.any():
-        raise ValueError("The preprocessing fit period contains no rows.")
-    station_medians_frame = (
-        data.loc[train_row_mask]
-        .groupby("station", observed=True)[list(CONTINUOUS_INPUT_COLUMNS)]
-        .median()
-    )
-    global_medians_series = data.loc[train_row_mask, list(CONTINUOUS_INPUT_COLUMNS)].median()
-
-    station_medians: dict[str, dict[str, float]] = {}
-    present_stations = tuple(data["station"].dropna().unique())
-    for station in present_stations:
-        medians = station_medians_frame.loc[station].fillna(global_medians_series)
-        station_medians[station] = {column: float(medians[column]) for column in CONTINUOUS_INPUT_COLUMNS}
-        station_mask = data["station"].eq(station)
-        for column in CONTINUOUS_INPUT_COLUMNS:
-            data.loc[station_mask, column] = data.loc[station_mask, column].fillna(
-                station_medians[station][column]
-            )
-
-    global_medians = {column: float(global_medians_series[column]) for column in CONTINUOUS_INPUT_COLUMNS}
-    data[list(CONTINUOUS_INPUT_COLUMNS)] = data[list(CONTINUOUS_INPUT_COLUMNS)].fillna(global_medians)
-    data["PM2.5_input_raw"] = data["PM2.5"]
-
-    wind_missing = data["wd"].isna() | ~data["wd"].isin(COMPASS_DEGREES)
-    wind_degrees = data["wd"].map(COMPASS_DEGREES).fillna(0.0)
-    wind_radians = np.deg2rad(wind_degrees.astype(float))
-    data["wind_sin"] = np.sin(wind_radians).astype("float32")
-    data["wind_cos"] = np.cos(wind_radians).astype("float32")
-    data["wind_missing"] = wind_missing.astype("float32")
-
-    data["hour_sin"] = np.sin(2 * np.pi * data["hour"] / 24.0).astype("float32")
-    data["hour_cos"] = np.cos(2 * np.pi * data["hour"] / 24.0).astype("float32")
-    day_of_year = data["timestamp"].dt.dayofyear
-    days_in_year = np.where(data["timestamp"].dt.is_leap_year, 366.0, 365.0)
-    data["doy_sin"] = np.sin(2 * np.pi * day_of_year / days_in_year).astype("float32")
-    data["doy_cos"] = np.cos(2 * np.pi * day_of_year / days_in_year).astype("float32")
-
-    station_columns: list[str] = []
-    for station in EXPECTED_STATIONS:
-        column = f"station__{station}"
-        data[column] = data["station"].eq(station).astype("float32")
-        station_columns.append(column)
-
-    scaler = StandardScaler()
-    scaled_columns = [f"z__{column}" for column in CONTINUOUS_INPUT_COLUMNS]
-    scaler.fit(data.loc[train_row_mask, list(CONTINUOUS_INPUT_COLUMNS)])
-    data[scaled_columns] = scaler.transform(data[list(CONTINUOUS_INPUT_COLUMNS)]).astype("float32")
-
-    missing_columns = [f"missing__{column}" for column in CONTINUOUS_INPUT_COLUMNS]
-    temporal_columns = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
-    wind_columns = ["wind_sin", "wind_cos", "wind_missing"]
-    feature_columns = scaled_columns + missing_columns + temporal_columns + wind_columns + station_columns
-
-    data["target_pm25"] = data.groupby("station", sort=False, observed=True)[
-        "PM2.5_target_original"
-    ].shift(-CONFIG.forecast_horizon)
-    data["target_timestamp"] = data.groupby("station", sort=False, observed=True)["timestamp"].shift(
-        -CONFIG.forecast_horizon
-    )
-    data["split"] = assign_split(
-        data["target_timestamp"],
+    policy = PreprocessingPolicy(
         train_start=train_start,
+        fit_end_exclusive=validation_start,
         validation_start=validation_start,
         test_start=test_start,
         data_end_exclusive=data_end_exclusive,
-    )
-
-    station_code = pd.Categorical(data["station"], categories=EXPECTED_STATIONS, ordered=True).codes
-    data["station_code"] = station_code.astype("int16")
-    anchors = np.arange(len(data))
-    starts = anchors - (lookback_hours - 1)
-    valid_start = starts >= 0
-    safe_starts = np.maximum(starts, 0)
-    same_station = data["station_code"].to_numpy()[safe_starts] == data["station_code"].to_numpy()
-    elapsed_hours = (
-        data["timestamp"].to_numpy(dtype="datetime64[h]")
-        - data["timestamp"].to_numpy(dtype="datetime64[h]")[safe_starts]
-    ).astype("timedelta64[h]").astype(int)
-    contiguous = elapsed_hours == lookback_hours - 1
-    data["valid_anchor"] = (
-        valid_start
-        & same_station
-        & contiguous
-        & data["target_pm25"].notna().to_numpy()
-        & data["split"].notna().to_numpy()
-    )
-
-    if data[feature_columns].isna().any().any():
-        raise ValueError("Model features contain missing values after preprocessing.")
-    if not np.isfinite(data[feature_columns].to_numpy(dtype="float32")).all():
-        raise ValueError("Model features contain non-finite values.")
-
-    artifacts = PreprocessingArtifacts(
-        scaler=scaler,
-        continuous_columns=list(CONTINUOUS_INPUT_COLUMNS),
-        scaled_columns=scaled_columns,
-        feature_columns=feature_columns,
-        station_medians=station_medians,
-        global_medians=global_medians,
-        station_columns=station_columns,
+        lookback_hours=lookback_hours,
         forward_fill_limit_hours=forward_fill_limit_hours,
-        fit_start=train_start,
-        fit_end_exclusive=validation_start,
     )
+    artifacts = fit_preprocessor(raw_data, policy, source_fingerprint=source_fingerprint)
+    data, metadata = transform_model_table(raw_data, artifacts, policy)
     if persist:
         joblib.dump(artifacts, paths.preprocessor_file)
-
-    split_counts = (
-        data.loc[data["valid_anchor"]]
-        .groupby("split", observed=True)
-        .size()
-        .reindex(["train", "validation", "test"], fill_value=0)
-        .astype(int)
-        .to_dict()
-    )
-    metadata = {
-        "lookback_hours": lookback_hours,
-        "forward_fill_limit_hours": forward_fill_limit_hours,
-        "forecast_horizon": CONFIG.forecast_horizon,
-        "feature_count": len(feature_columns),
-        "features": feature_columns,
-        "split_counts": split_counts,
-        "split_boundaries": {
-            "train_start": train_start,
-            "validation_start": validation_start,
-            "test_start": test_start,
-            "data_end_exclusive": data_end_exclusive,
-        },
-        "preprocessing_fit": {
-            "start": train_start,
-            "end_exclusive": validation_start,
-        },
-    }
-    if persist:
         _write_json(
             paths.feature_metadata,
-            {"features": feature_columns, "count": len(feature_columns)},
+            {"features": artifacts.feature_columns, "count": len(artifacts.feature_columns)},
         )
         _write_json(paths.split_metadata, metadata)
     return data, artifacts, metadata
+
+
+def partition_frozen_benchmark(data: pd.DataFrame, paths: ProjectPaths) -> tuple[int, int]:
+    """Persist physically separate development and frozen-benchmark source tables."""
+
+    ordered = _ordered_copy(data)
+    development = ordered.loc[ordered["timestamp"] < pd.Timestamp(CONFIG.test_start)].copy()
+    benchmark = ordered.loc[ordered["timestamp"] >= pd.Timestamp(CONFIG.test_start)].copy()
+    if development.empty or benchmark.empty:
+        raise ValueError("Chronological benchmark partition produced an empty side.")
+    development.to_parquet(paths.development_parquet, index=False)
+    benchmark.to_parquet(paths.frozen_benchmark_parquet, index=False)
+    return len(development), len(benchmark)
+
+
+def load_development_data(paths: ProjectPaths) -> pd.DataFrame:
+    """Load only rows available to preprocessing, validation, and model selection."""
+
+    if not paths.development_parquet.exists():
+        raise FileNotFoundError("Development data is missing; run the acquire stage first.")
+    data = pd.read_parquet(paths.development_parquet)
+    data["timestamp"] = pd.to_datetime(data["timestamp"])
+    if bool((data["timestamp"] >= pd.Timestamp(CONFIG.test_start)).any()):
+        raise RuntimeError("Development data contains frozen-benchmark timestamps.")
+    return data
+
+
+def load_frozen_benchmark(
+    paths: ProjectPaths,
+    final_selection_path: Path,
+    *,
+    expected_source_fingerprint: str | None = None,
+) -> pd.DataFrame:
+    """Load benchmark rows only after the final model-selection record is locked."""
+
+    if not final_selection_path.exists():
+        raise PermissionError("Frozen benchmark access requires a final model-selection record.")
+    selection = json.loads(final_selection_path.read_text(encoding="utf-8"))
+    if not selection.get("selection_locked_before_benchmark"):
+        raise PermissionError("The final model-selection record is not benchmark-locked.")
+    if expected_source_fingerprint is not None:
+        recorded = selection.get("source_fingerprint")
+        if recorded != expected_source_fingerprint:
+            raise RuntimeError("Final selection and current methodology fingerprints differ.")
+    if not paths.frozen_benchmark_parquet.exists():
+        raise FileNotFoundError("Frozen benchmark data is missing; run the acquire stage first.")
+    data = pd.read_parquet(paths.frozen_benchmark_parquet)
+    data["timestamp"] = pd.to_datetime(data["timestamp"])
+    if bool((data["timestamp"] < pd.Timestamp(CONFIG.test_start)).any()):
+        raise RuntimeError("Frozen benchmark contains development timestamps.")
+    return data
 
 
 def save_model_table(data: pd.DataFrame, paths: ProjectPaths) -> None:

@@ -58,6 +58,30 @@ class PersistenceResidual(layers.Layer):
         }
 
 
+@keras.utils.register_keras_serializable(package="odl")
+class SerializableHuber(keras.losses.Loss):
+    """Huber loss whose non-default delta survives Keras serialization."""
+
+    def __init__(
+        self,
+        delta: float = CONFIG.huber_delta,
+        reduction: str = "sum_over_batch_size",
+        name: str = "huber",
+    ) -> None:
+        super().__init__(reduction=reduction, name=name)
+        self.delta = float(delta)
+
+    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        error = tf.cast(y_pred, self.dtype) - tf.cast(y_true, self.dtype)
+        absolute_error = tf.abs(error)
+        quadratic = tf.minimum(absolute_error, self.delta)
+        linear = absolute_error - quadratic
+        return 0.5 * tf.square(quadratic) + self.delta * linear
+
+    def get_config(self) -> dict[str, Any]:
+        return {**super().get_config(), "delta": self.delta}
+
+
 def _compile(
     model: keras.Model,
     learning_rate: float,
@@ -65,7 +89,7 @@ def _compile(
 ) -> keras.Model:
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=keras.losses.Huber(delta=huber_delta),
+        loss=SerializableHuber(delta=huber_delta),
         metrics=[
             keras.metrics.MeanAbsoluteError(name="mae"),
             keras.metrics.RootMeanSquaredError(name="rmse"),
@@ -163,36 +187,6 @@ def build_cnn(
     x = layers.Dense(dense_units, activation="relu", kernel_regularizer=regularizer, name="dense")(x)
     outputs = layers.Dense(1, name="pm25_next_hour")(x)
     return _compile(keras.Model(inputs, outputs, name="cnn_forecaster"), learning_rate, huber_delta)
-
-
-def build_tunable_lstm(hp: Any, input_shape: tuple[int, int]) -> keras.Model:
-    """Keras Tuner search space for the LSTM family."""
-
-    return build_lstm(
-        input_shape=input_shape,
-        units=hp.Choice("units", [32, 64, 128]),
-        dense_units=hp.Choice("dense_units", [16, 32, 64]),
-        dropout=hp.Float("dropout", 0.1, 0.4, step=0.1),
-        learning_rate=hp.Float("learning_rate", 1e-4, 3e-3, sampling="log"),
-        l2_strength=hp.Choice("l2_strength", [0.0, 1e-5, 1e-4]),
-        num_layers=hp.Choice("num_layers", [1, 2]),
-    )
-
-
-def build_tunable_cnn(hp: Any, input_shape: tuple[int, int]) -> keras.Model:
-    """Keras Tuner search space for the causal CNN family."""
-
-    return build_cnn(
-        input_shape=input_shape,
-        filters=hp.Choice("filters", [32, 64, 128]),
-        kernel_size=hp.Choice("kernel_size", [3, 5, 7]),
-        dense_units=hp.Choice("dense_units", [16, 32, 64]),
-        dropout=hp.Float("dropout", 0.1, 0.4, step=0.1),
-        learning_rate=hp.Float("learning_rate", 1e-4, 3e-3, sampling="log"),
-        l2_strength=hp.Choice("l2_strength", [0.0, 1e-5, 1e-4]),
-        num_blocks=hp.Choice("num_blocks", [1, 2, 3]),
-        dilated=True,
-    )
 
 
 def standard_callbacks(

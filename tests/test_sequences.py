@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from shared.sequence_pipeline import StationWindowSequence
+from shared.sequence_pipeline import StationWindowSequence, prediction_frame
 
 
 def sequence_table() -> pd.DataFrame:
@@ -58,3 +58,19 @@ def test_cross_station_anchor_is_rejected():
             shuffle=False,
         )
 
+
+def test_daily_persistence_is_exactly_24_hours_before_target():
+    table = sequence_table()
+    sequence = StationWindowSequence(
+        table,
+        ["feature"],
+        split="train",
+        lookback=24,
+        batch_size=10,
+        shuffle=False,
+    )
+    frame = prediction_frame(table, sequence, np.zeros(len(sequence.ordered_anchor_indices())))
+    np.testing.assert_array_equal(frame["daily_persistence"], np.arange(7, dtype=float))
+    target_time = pd.to_datetime(frame.loc[0, "target_timestamp"])
+    source_time = table.loc[table["PM2.5_input_raw"].eq(frame.loc[0, "daily_persistence"]), "timestamp"].iloc[0]
+    assert target_time - source_time == pd.Timedelta(hours=24)

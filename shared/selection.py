@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -106,17 +107,45 @@ def generate_lstm_candidates(seed: int = 42, count: int = 16) -> list[LSTMConfig
 
 
 def aggregate_validation_results(results: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate fold/seed MAE and attach a standard error for selection."""
+    """Average seeds within folds, then estimate uncertainty across folds."""
 
-    required = {"candidate_id", "mae", "parameters", "num_layers", "formulation"}
+    required = {
+        "candidate_id",
+        "fold",
+        "seed",
+        "mae",
+        "best_epoch",
+        "parameters",
+        "num_layers",
+        "formulation",
+    }
     missing = required - set(results.columns)
     if missing:
         raise ValueError(f"Validation results lack columns: {sorted(missing)}")
+    fold_results = (
+        results.groupby(["candidate_id", "fold"], observed=True)
+        .agg(
+            fold_mean_mae=("mae", "mean"),
+            fold_seed_std_mae=("mae", "std"),
+            seeds=("seed", "nunique"),
+        )
+        .reset_index()
+    )
     grouped = (
+        fold_results.groupby("candidate_id", observed=True)
+        .agg(
+            mean_mae=("fold_mean_mae", "mean"),
+            std_mae=("fold_mean_mae", "std"),
+            folds=("fold", "nunique"),
+            mean_seed_std_mae=("fold_seed_std_mae", "mean"),
+            min_seeds_per_fold=("seeds", "min"),
+            max_seeds_per_fold=("seeds", "max"),
+        )
+        .reset_index()
+    )
+    fit_summary = (
         results.groupby("candidate_id", observed=True)
         .agg(
-            mean_mae=("mae", "mean"),
-            std_mae=("mae", "std"),
             evaluations=("mae", "size"),
             mean_best_epoch=("best_epoch", "mean"),
             median_best_epoch=("best_epoch", "median"),
@@ -126,8 +155,71 @@ def aggregate_validation_results(results: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    grouped["se_mae"] = grouped["std_mae"].fillna(0.0) / np.sqrt(grouped["evaluations"])
+    grouped = grouped.merge(fit_summary, on="candidate_id", validate="one_to_one")
+    grouped["mean_seed_std_mae"] = grouped["mean_seed_std_mae"].fillna(0.0)
+    grouped["se_mae"] = grouped["std_mae"].fillna(0.0) / np.sqrt(grouped["folds"])
     return grouped.sort_values(["mean_mae", "parameters", "num_layers", "formulation"]).reset_index(drop=True)
+
+
+def validate_search_completeness(
+    results: pd.DataFrame,
+    candidate_ids: Iterable[str],
+    fold_names: Iterable[str],
+    seeds: Iterable[int],
+    *,
+    source_fingerprint: str | None = None,
+) -> pd.DataFrame:
+    """Return the exact intended search rows or reject missing/duplicate/extra fits."""
+
+    required = {"candidate_id", "fold", "seed"}
+    missing_columns = required - set(results.columns)
+    if missing_columns:
+        raise ValueError(f"Search results lack columns: {sorted(missing_columns)}")
+    filtered = results.copy()
+    if source_fingerprint is not None:
+        if "source_fingerprint" not in filtered:
+            raise ValueError("Search results lack a methodology source fingerprint.")
+        filtered = filtered.loc[filtered["source_fingerprint"].eq(source_fingerprint)].copy()
+    candidates = tuple(candidate_ids)
+    folds = tuple(fold_names)
+    seed_values = tuple(int(seed) for seed in seeds)
+    expected = {
+        (candidate, fold, seed)
+        for candidate in candidates
+        for fold in folds
+        for seed in seed_values
+    }
+    observed_rows = [
+        (str(row.candidate_id), str(row.fold), int(row.seed))
+        for row in filtered.itertuples(index=False)
+    ]
+    observed = set(observed_rows)
+    if observed != expected or len(observed_rows) != len(expected):
+        raise ValueError(
+            f"Search completeness check failed: expected {len(expected)} unique fits, "
+            f"observed {len(observed)} unique fits across {len(observed_rows)} rows."
+        )
+    return filtered.sort_values(["candidate_id", "fold", "seed"], kind="stable").reset_index(drop=True)
+
+
+def selection_audit(summary: pd.DataFrame, selected: pd.Series) -> dict[str, Any]:
+    """Return the threshold, eligible candidates, and deterministic tie rationale."""
+
+    best = summary.sort_values("mean_mae", kind="stable").iloc[0]
+    threshold = float(best["mean_mae"] + best["se_mae"])
+    eligible = summary.loc[summary["mean_mae"] <= threshold, "candidate_id"].astype(str).tolist()
+    return {
+        "best_candidate_by_mean_mae": str(best["candidate_id"]),
+        "best_mean_mae": float(best["mean_mae"]),
+        "best_fold_level_standard_error": float(best["se_mae"]),
+        "one_standard_error_threshold": threshold,
+        "eligible_candidates": eligible,
+        "selected_candidate": str(selected["candidate_id"]),
+        "tie_break_reason": (
+            "Among candidates within one fold-level standard error, prefer fewer parameters, "
+            "then fewer LSTM layers, then direct forecasting."
+        ),
+    }
 
 
 def select_one_standard_error(

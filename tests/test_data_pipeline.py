@@ -6,7 +6,14 @@ import numpy as np
 import pandas as pd
 
 from shared.config import EXPECTED_STATIONS, ProjectPaths
-from shared.data_pipeline import create_model_table, load_and_validate_raw
+from shared.data_pipeline import (
+    PreprocessingPolicy,
+    create_model_table,
+    fit_preprocessor,
+    load_frozen_benchmark,
+    load_and_validate_raw,
+    transform_model_table,
+)
 
 
 def synthetic_raw() -> pd.DataFrame:
@@ -114,3 +121,45 @@ def test_forward_fill_is_capped_before_train_fitted_median_fallback(tmp_path):
     assert table.loc[rows[22], "PM2.5_input_raw"] == 10.0
     assert table.loc[rows[23], "PM2.5_input_raw"] == artifacts.station_medians[station]["PM2.5"]
     assert table.loc[rows[23], "missing__PM2.5"] == 1.0
+
+
+def test_fit_then_transform_matches_convenience_interface(tmp_path):
+    raw = synthetic_raw()
+    policy = PreprocessingPolicy()
+    artifacts = fit_preprocessor(raw, policy, source_fingerprint="test-source")
+    transformed, metadata = transform_model_table(raw, artifacts, policy)
+    wrapped, wrapped_artifacts, wrapped_metadata = create_model_table(
+        raw,
+        ProjectPaths(tmp_path),
+        persist=False,
+        source_fingerprint="test-source",
+    )
+    np.testing.assert_allclose(
+        transformed[artifacts.feature_columns],
+        wrapped[wrapped_artifacts.feature_columns],
+    )
+    assert metadata == wrapped_metadata
+    assert artifacts.source_fingerprint == "test-source"
+
+
+def test_frozen_benchmark_cannot_load_before_selection_is_locked(tmp_path):
+    paths = ProjectPaths(tmp_path)
+    paths.ensure_directories()
+    benchmark = synthetic_raw().iloc[:4].copy()
+    benchmark["timestamp"] = pd.date_range("2016-08-01", periods=4, freq="h")
+    benchmark.to_parquet(paths.frozen_benchmark_parquet, index=False)
+    selection = paths.models / "final_model_selection_smoke.json"
+
+    with np.testing.assert_raises(PermissionError):
+        load_frozen_benchmark(paths, selection)
+
+    selection.write_text('{"selection_locked_before_benchmark": false}', encoding="utf-8")
+    with np.testing.assert_raises(PermissionError):
+        load_frozen_benchmark(paths, selection)
+
+    selection.write_text(
+        '{"selection_locked_before_benchmark": true, "source_fingerprint": "abc"}',
+        encoding="utf-8",
+    )
+    loaded = load_frozen_benchmark(paths, selection, expected_source_fingerprint="abc")
+    assert len(loaded) == 4

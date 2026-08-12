@@ -23,6 +23,12 @@ from .config import CONFIG, PATHS, ExperimentConfig, ProjectPaths
 RunMode = Literal["smoke", "full"]
 DeviceChoice = Literal["auto", "gpu", "cpu"]
 PIPELINE_STAGES = ("acquire", "prepare", "baselines", "tune", "evaluate", "render")
+METHODOLOGY_SOURCE_GLOBS = (
+    "shared/**/*.py",
+    "scripts/*.py",
+    "pyproject.toml",
+    "uv.lock",
+)
 
 
 def utc_now() -> str:
@@ -36,6 +42,62 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     temporary.replace(path)
+
+
+def methodology_source_files(root: Path) -> list[Path]:
+    """Return the deterministic source manifest used to validate artifact reuse."""
+
+    files: set[Path] = set()
+    for pattern in METHODOLOGY_SOURCE_GLOBS:
+        files.update(path for path in root.glob(pattern) if path.is_file())
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+
+
+def source_fingerprint(root: Path) -> str:
+    """Hash training source contents and paths, independent of Git metadata."""
+
+    digest = hashlib.sha256()
+    files = methodology_source_files(root)
+    if not files:
+        digest.update(b"empty-methodology-source-manifest")
+    for path in files:
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def methodology_dirty_paths(root: Path) -> list[str]:
+    """Return tracked dirty methodology paths, allowing generated notebook outputs."""
+
+    if shutil.which("git") is None or not (root / ".git").exists():
+        return []
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    dirty: list[str] = []
+    for line in output.splitlines():
+        path = line[3:].split(" -> ")[-1]
+        if path.endswith(".ipynb"):
+            continue
+        dirty.append(path)
+    return dirty
+
+
+def assert_clean_methodology(root: Path) -> None:
+    dirty = methodology_dirty_paths(root)
+    if dirty:
+        raise RuntimeError(
+            "Full training requires committed methodology source. Dirty tracked files: "
+            + ", ".join(dirty)
+        )
 
 
 @dataclass(frozen=True)
@@ -96,11 +158,16 @@ class RunStateStore:
         self.options = options
         self.path = paths.run_state / f"{options.mode}.json"
         self.config_hash = options.stable_hash()
+        self.source_fingerprint = source_fingerprint(paths.root)
+        fingerprint_payload = f"{self.config_hash}:{self.source_fingerprint}".encode("utf-8")
+        self.run_fingerprint = hashlib.sha256(fingerprint_payload).hexdigest()[:16]
 
     def _new_state(self) -> dict[str, Any]:
         return {
             "mode": self.options.mode,
             "config_hash": self.config_hash,
+            "source_fingerprint": self.source_fingerprint,
+            "run_fingerprint": self.run_fingerprint,
             "created_at_utc": utc_now(),
             "updated_at_utc": utc_now(),
             "current_stage": None,
@@ -118,6 +185,12 @@ class RunStateStore:
                 "Existing run state was produced by a different configuration "
                 f"({recorded} != {self.config_hash}). Archive it or use the recorded "
                 "batch/device settings before resuming."
+            )
+        recorded_source = state.get("source_fingerprint")
+        if recorded_source != self.source_fingerprint:
+            raise RuntimeError(
+                "Existing run state was produced by different methodology source "
+                f"({recorded_source} != {self.source_fingerprint}). Start a fresh run."
             )
         return state
 
@@ -186,6 +259,57 @@ class RunStateStore:
         return self.load().get("stages", {}).get(key, {}).get("summary", {})
 
 
+def archive_existing_run(paths: ProjectPaths, mode: RunMode) -> Path | None:
+    """Archive compact evidence and clear progress so ``--no-resume`` is fresh."""
+
+    suffix = "" if mode == "full" else "_smoke"
+    state_path = paths.run_state / f"{mode}.json"
+    progress_names = (
+        f"forward_fill_ablation{suffix}.csv",
+        f"lookback_ablation{suffix}.csv",
+        f"basic_rolling_results{suffix}.csv",
+        f"random_search_rolling_results{suffix}.csv",
+    )
+    headline_paths = [
+        state_path,
+        paths.environment_artifacts / f"environment_{mode}.json",
+        paths.assignment2_tables / f"final_overall_metrics{suffix}.csv",
+        paths.assignment2_tables / f"paired_moving_block_bootstrap{suffix}.csv",
+        paths.assignment2_tables / f"paired_block_bootstrap{suffix}.csv",
+        paths.assignment2_tables / f"random_search_summary{suffix}.csv",
+        paths.assignment2_tables / f"optimization_claim{suffix}.json",
+        paths.models / f"best_hyperparameters{suffix}.json",
+        paths.models / f"final_model_selection{suffix}.json",
+        paths.processed / f"selected_preprocessing{suffix}.json",
+        paths.processed / f"rolling_validation_metadata{suffix}.json",
+    ]
+    progress_paths = [paths.assignment2_tables / name for name in progress_names]
+    existing = [path for path in [*headline_paths, *progress_paths] if path.exists()]
+    if not existing:
+        return None
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    destination = paths.run_state / "archive" / f"{mode}_{timestamp}"
+    destination.mkdir(parents=True, exist_ok=False)
+    copied: list[str] = []
+    for path in existing:
+        target = destination / path.name
+        shutil.copy2(path, target)
+        copied.append(str(path.relative_to(paths.root)))
+    write_json_atomic(
+        destination / "archive_manifest.json",
+        {
+            "archived_at_utc": utc_now(),
+            "mode": mode,
+            "files": copied,
+            "note": "Compact V2 audit snapshot; trained model directories were not duplicated.",
+        },
+    )
+    state_path.unlink(missing_ok=True)
+    for path in progress_paths:
+        path.unlink(missing_ok=True)
+    return destination
+
+
 @contextmanager
 def tracked_stage(
     store: RunStateStore,
@@ -251,7 +375,6 @@ def nvidia_smi_snapshot() -> dict[str, Any]:
 def _package_versions() -> dict[str, str | None]:
     packages = (
         "tensorflow",
-        "keras-tuner",
         "numpy",
         "pandas",
         "pyarrow",
@@ -336,9 +459,12 @@ def run_preflight(
 ) -> tuple[RuntimeOptions, dict[str, Any]]:
     """Validate the WSL/TensorFlow runtime and persist reproducibility evidence."""
 
+    if options.mode == "full":
+        assert_clean_methodology(paths.root)
     tf, selected_device, gpus = configure_tensorflow(options)
     batch_size = probe_batch_size(tf, options.batch_size) if probe_batch else options.batch_size
     resolved = replace(options, device=selected_device, batch_size=batch_size)
+    resolved_store = RunStateStore(paths, resolved)
     uname = platform.uname()
     environment = {
         "captured_at_utc": utc_now(),
@@ -357,6 +483,8 @@ def run_preflight(
         "git": git_metadata(paths.root),
         "experiment_config": resolved.experiment_config().to_dict(),
         "config_hash": resolved.stable_hash(),
+        "source_fingerprint": resolved_store.source_fingerprint,
+        "run_fingerprint": resolved_store.run_fingerprint,
     }
     paths.ensure_directories()
     write_json_atomic(paths.environment_artifacts / f"environment_{options.mode}.json", environment)

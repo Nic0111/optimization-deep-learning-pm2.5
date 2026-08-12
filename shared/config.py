@@ -126,8 +126,20 @@ class ProjectPaths:
         return self.interim / "combined_hourly.parquet"
 
     @property
+    def development_parquet(self) -> Path:
+        return self.interim / "development_hourly.parquet"
+
+    @property
+    def frozen_benchmark_parquet(self) -> Path:
+        return self.interim / "frozen_benchmark_hourly.parquet"
+
+    @property
     def model_table(self) -> Path:
         return self.processed / "model_table.parquet"
+
+    @property
+    def benchmark_model_table(self) -> Path:
+        return self.processed / "frozen_benchmark_model_table.parquet"
 
     @property
     def feature_metadata(self) -> Path:
@@ -136,6 +148,10 @@ class ProjectPaths:
     @property
     def split_metadata(self) -> Path:
         return self.processed / "split_metadata.json"
+
+    @property
+    def benchmark_split_metadata(self) -> Path:
+        return self.processed / "frozen_benchmark_split_metadata.json"
 
     @property
     def rolling_validation_metadata(self) -> Path:
@@ -212,7 +228,7 @@ RAW_COLUMNS = (
 class ExperimentConfig:
     """Experiment constants that must not drift between notebooks."""
 
-    methodology_version: str = "v2-rolling-residual-2026-08"
+    methodology_version: str = "v2.1-audited-2026-08"
     source_url: str = (
         "https://archive.ics.uci.edu/static/public/501/"
         "beijing%2Bmulti%2Bsite%2Bair%2Bquality%2Bdata.zip"
