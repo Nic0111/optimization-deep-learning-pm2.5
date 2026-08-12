@@ -17,28 +17,6 @@ def test_runtime_options_use_separate_smoke_artifacts():
     assert smoke.stable_hash() != full.stable_hash()
 
 
-def test_seed_checkpoint_selection_is_run_mode_specific(tmp_path):
-    paths = ProjectPaths(tmp_path)
-    paths.models.mkdir(parents=True)
-    for filename in (
-        "tuned_lstm_seed_42.keras",
-        "tuned_lstm_seed_52.keras",
-        "tuned_lstm_seed_62.keras",
-        "tuned_lstm_seed_42_smoke.keras",
-    ):
-        (paths.models / filename).touch()
-
-    full = workflow._seed_checkpoint_paths(paths, "lstm", "")
-    smoke = workflow._seed_checkpoint_paths(paths, "lstm", "_smoke")
-
-    assert [path.name for path in full] == [
-        "tuned_lstm_seed_42.keras",
-        "tuned_lstm_seed_52.keras",
-        "tuned_lstm_seed_62.keras",
-    ]
-    assert [path.name for path in smoke] == ["tuned_lstm_seed_42_smoke.keras"]
-
-
 def test_run_state_requires_outputs_to_exist(tmp_path):
     paths = ProjectPaths(tmp_path)
     paths.ensure_directories()

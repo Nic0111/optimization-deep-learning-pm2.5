@@ -388,7 +388,7 @@ def build_tuning_notebook() -> None:
             balance direct and persistence-residual formulations. Random search is efficient when
             only some dimensions strongly affect performance
             ([Bergstra and Bengio](https://www.jmlr.org/papers/v13/bergstra12a.html)). **Alternatives.**
-            The previous single-execution Hyperband result was smaller than seed variation.
+            The previous single-execution search result was smaller than seed variation.
             **Trade-off.** Six validation fits per candidate cost more but make selection more
             defensible. The frozen test benchmark is never read during selection.
             """

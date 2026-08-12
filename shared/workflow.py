@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import time
 from collections.abc import Callable
@@ -64,23 +63,6 @@ StageFunction = Callable[[RuntimeOptions, ProjectPaths, RunStateStore], tuple[di
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _seed_checkpoint_paths(
-    paths: ProjectPaths,
-    architecture: str,
-    suffix: str,
-) -> list[Path]:
-    """Return only seed checkpoints belonging to the requested run mode."""
-
-    pattern = re.compile(
-        rf"^tuned_{re.escape(architecture)}_seed_\d+{re.escape(suffix)}\.keras$"
-    )
-    return sorted(
-        path
-        for path in paths.models.glob(f"tuned_{architecture}_seed_*.keras")
-        if pattern.fullmatch(path.name)
-    )
 
 
 def _write_frame(frame: pd.DataFrame, path: Path, index: bool = False) -> None:
