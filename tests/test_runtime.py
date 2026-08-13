@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from shared import workflow
@@ -86,7 +87,7 @@ def test_no_resume_archive_clears_state_and_progress_only(tmp_path):
     paths.ensure_directories()
     state = paths.run_state / "smoke.json"
     state.write_text('{"status": "complete"}', encoding="utf-8")
-    progress = paths.assignment2_tables / "random_search_rolling_results_smoke.csv"
+    progress = paths.assignment2_tables / "focused_lstm_search_results_smoke.csv"
     progress.write_text("candidate_id\ncandidate_00\n", encoding="utf-8")
     model = paths.models / "tuned_final_smoke.keras"
     model.write_text("model", encoding="utf-8")
@@ -96,3 +97,26 @@ def test_no_resume_archive_clears_state_and_progress_only(tmp_path):
     assert not state.exists()
     assert not progress.exists()
     assert model.exists()
+
+
+def test_named_completeness_discards_unrelated_feature_candidate_id():
+    rows = [
+        {
+            "candidate_id": "pm25_dynamics",
+            "model": model,
+            "fold": "fold_1",
+            "seed": 42,
+            "source_fingerprint": "source",
+        }
+        for model in ("lstm", "cnn")
+    ]
+    validated = workflow._validate_named_completeness(
+        pd.DataFrame(rows),
+        item_column="model",
+        item_ids=("lstm", "cnn"),
+        fold_names=("fold_1",),
+        seeds=(42,),
+        source_fingerprint="source",
+    )
+    assert set(validated["model"]) == {"lstm", "cnn"}
+    assert "candidate_id" not in validated

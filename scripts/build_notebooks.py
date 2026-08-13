@@ -269,8 +269,9 @@ def build_eda_notebook() -> None:
             training-fitted scaling, and target-time chronological splits. **Alternatives.** Random
             splitting leaks future regimes; unrestricted filling can freeze a sensor for weeks;
             interpolation can use future values. **Evidence.** The missing-run table includes long
-            pollutant gaps, while the ablation tables select the fill cap and lookback over three
-            expanding validation folds. **Support.** Rolling evaluation respects forecasting order
+            pollutant gaps. V2.2 retains the V2.1 validation-selected 24-hour fill cap and 12-hour
+            lookback, then compares three causal feature policies over repeated-seed expanding
+            folds. **Support.** Rolling evaluation respects forecasting order
             ([Bergmeir et al.](https://doi.org/10.1016/j.csda.2017.11.003)). **Trade-off.** Median
             fallback is robust but smooths unusual conditions. Targets retain original, unfilled
             measurements and splits are assigned by target timestamp.
@@ -288,17 +289,21 @@ def build_eda_notebook() -> None:
             split_distribution = pd.read_csv(
                 PATHS.assignment1_tables / "target_distribution_by_split.csv", index_col=0
             )
-            fill_ablation = pd.read_csv(
-                PATHS.assignment2_tables / f"forward_fill_ablation_summary{suffix}.csv"
+            preprocessing_lock = json.loads(
+                (PATHS.processed / f"preprocessing_lock{suffix}.json").read_text(encoding="utf-8")
             )
-            lookback_ablation = pd.read_csv(
-                PATHS.assignment2_tables / f"lookback_ablation_summary{suffix}.csv"
+            feature_ablation = pd.read_csv(
+                PATHS.assignment2_tables / f"feature_policy_ablation_summary{suffix}.csv"
+            )
+            feature_audit = pd.read_csv(
+                PATHS.assignment2_tables / f"feature_policy_paired_audit{suffix}.csv"
             )
             display(feature_metadata)
             display(split_metadata)
             display(split_distribution)
-            display(fill_ablation)
-            display(lookback_ablation)
+            display(preprocessing_lock)
+            display(feature_ablation)
+            display(feature_audit)
             display(Image(filename=str(
                 PATHS.assignment1_figures / "target_distribution_by_split.png"
             )))
@@ -336,7 +341,15 @@ def build_baselines_notebook() -> None:
             baseline_metrics = pd.read_csv(
                 PATHS.assignment2_tables / f"validation_baseline_metrics{suffix}.csv"
             )
+            feature_summary = pd.read_csv(
+                PATHS.assignment2_tables / f"feature_policy_ablation_summary{suffix}.csv"
+            )
+            selected_preprocessing = json.loads(
+                (PATHS.processed / f"selected_preprocessing{suffix}.json").read_text(encoding="utf-8")
+            )
             display(baseline_metrics)
+            display(feature_summary)
+            display(selected_preprocessing)
             """
         ),
         markdown(
@@ -380,22 +393,24 @@ def build_baselines_notebook() -> None:
 def build_tuning_notebook() -> None:
     cells = bootstrap_cells(
         "Assignment 2 — Hyperparameter Tuning",
-        "Tune the validation-selected architecture with repeated-seed rolling random search.",
+        "Improve one LSTM through causal features, optimization recipes, and paired rolling selection.",
         "tune",
     )
     cells += [
         markdown(
             """
-            ## Stratified random-search evidence
+            ## Staged, focused tuning evidence
 
-            **Decision.** Evaluate 16 deterministic candidates across three rolling folds and seeds
-            42/52. Two anchors preserve the basic and previous-best settings; remaining candidates
-            balance direct and persistence-residual formulations. Random search is efficient when
+            **Decision.** First compare six preregistered loss/optimizer recipes using candidate
+            13's promising residual architecture, then evaluate 12 deterministic local candidates
+            across three rolling folds and seeds 42/52. The local search contains the basic and
+            candidate-13 anchors plus ten balanced configurations. Random search is efficient when
             only some dimensions strongly affect performance
             ([Bergstra and Bengio](https://www.jmlr.org/papers/v13/bergstra12a.html)). **Alternatives.**
-            The previous single-execution search result was smaller than seed variation.
-            **Trade-off.** Six validation fits per candidate cost more but make selection more
-            defensible. The frozen test benchmark is never read during selection.
+            A broad second global search would spend scarce GPU time in regions already shown to be
+            weak. **Trade-off.** The focused design costs 108 recipe/search fits after the 18-fit
+            feature experiment, but every decision remains based on rolling MAE. The frozen
+            benchmark is never read during selection.
             """
         ),
         code(
@@ -403,16 +418,32 @@ def build_tuning_notebook() -> None:
             import pandas as pd
 
             suffix = OPTIONS.artifact_suffix
+            recipe_trials = pd.read_csv(
+                PATHS.assignment2_tables / f"optimization_recipe_results{suffix}.csv"
+            )
+            recipe_summary = pd.read_csv(
+                PATHS.assignment2_tables / f"optimization_recipe_summary{suffix}.csv"
+            )
+            recipe_audit = pd.read_csv(
+                PATHS.assignment2_tables / f"optimization_recipe_paired_audit{suffix}.csv"
+            )
             trials = pd.read_csv(
-                PATHS.assignment2_tables / f"random_search_rolling_results{suffix}.csv"
+                PATHS.assignment2_tables / f"focused_lstm_search_results{suffix}.csv"
             )
             summary = pd.read_csv(
-                PATHS.assignment2_tables / f"random_search_summary{suffix}.csv"
+                PATHS.assignment2_tables / f"focused_lstm_search_summary{suffix}.csv"
+            )
+            paired_audit = pd.read_csv(
+                PATHS.assignment2_tables / f"focused_lstm_paired_audit{suffix}.csv"
             )
             best_hyperparameters = json.loads(
                 (PATHS.models / f"best_hyperparameters{suffix}.json").read_text(encoding="utf-8")
             )
+            display(recipe_summary)
+            display(recipe_audit)
+            display(recipe_trials)
             display(summary)
+            display(paired_audit)
             display(trials)
             display(best_hyperparameters)
             """
@@ -421,13 +452,13 @@ def build_tuning_notebook() -> None:
             """
             ## Final validation selection and fixed official model
 
-            **Decision.** Average seeds within each fold, estimate standard error across the three
-            future folds, then apply the one-standard-error rule, preferring fewer parameters, fewer
-            layers, then a direct formulation when performance is practically tied. The selected
-            configuration is trained once with seed 42 on all pre-test data for the median
-            validation-derived epoch budget. Huber loss limits the influence of extreme spikes
-            ([Huber](https://doi.org/10.1214/aoms/1177703732)). **Trade-off.** Simplicity may give up
-            a tiny mean-MAE advantage in exchange for stability and clearer attribution.
+            **Decision.** Average seeds within each fold and compare every configuration directly
+            with the raw winner. Simplicity is used only when the mean paired degradation is no
+            greater than its paired fold-level standard error. A non-basic configuration must beat
+            the official basic LSTM on mean MAE and at least two folds before the benchmark can be
+            opened. The selected configuration is trained once with seed 42 for the median
+            validation-derived epoch budget. **Trade-off.** The gate can reject an apparent small
+            gain, but prevents a benchmark-driven retry and makes the final claim auditable.
             """
         ),
         code(
@@ -435,7 +466,11 @@ def build_tuning_notebook() -> None:
             final_selection = json.loads(
                 (PATHS.models / f"final_model_selection{suffix}.json").read_text(encoding="utf-8")
             )
+            validation_gate = json.loads(
+                (PATHS.models / f"focused_lstm_validation_gate{suffix}.json").read_text(encoding="utf-8")
+            )
             display(final_selection)
+            display(validation_gate)
             print("Rolling tuning and single-model selection complete.")
             """
         ),

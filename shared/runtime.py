@@ -265,10 +265,10 @@ def archive_existing_run(paths: ProjectPaths, mode: RunMode) -> Path | None:
     suffix = "" if mode == "full" else "_smoke"
     state_path = paths.run_state / f"{mode}.json"
     progress_names = (
-        f"forward_fill_ablation{suffix}.csv",
-        f"lookback_ablation{suffix}.csv",
+        f"feature_policy_ablation{suffix}.csv",
         f"basic_rolling_results{suffix}.csv",
-        f"random_search_rolling_results{suffix}.csv",
+        f"optimization_recipe_results{suffix}.csv",
+        f"focused_lstm_search_results{suffix}.csv",
     )
     headline_paths = [
         state_path,
@@ -276,10 +276,13 @@ def archive_existing_run(paths: ProjectPaths, mode: RunMode) -> Path | None:
         paths.assignment2_tables / f"final_overall_metrics{suffix}.csv",
         paths.assignment2_tables / f"paired_moving_block_bootstrap{suffix}.csv",
         paths.assignment2_tables / f"paired_block_bootstrap{suffix}.csv",
-        paths.assignment2_tables / f"random_search_summary{suffix}.csv",
+        paths.assignment2_tables / f"feature_policy_ablation_summary{suffix}.csv",
+        paths.assignment2_tables / f"optimization_recipe_summary{suffix}.csv",
+        paths.assignment2_tables / f"focused_lstm_search_summary{suffix}.csv",
         paths.assignment2_tables / f"optimization_claim{suffix}.json",
         paths.models / f"best_hyperparameters{suffix}.json",
         paths.models / f"final_model_selection{suffix}.json",
+        paths.models / f"focused_lstm_validation_gate{suffix}.json",
         paths.processed / f"selected_preprocessing{suffix}.json",
         paths.processed / f"rolling_validation_metadata{suffix}.json",
     ]

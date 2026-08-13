@@ -8,6 +8,7 @@ import pandas as pd
 from shared.config import EXPECTED_STATIONS, ProjectPaths
 from shared.data_pipeline import (
     PreprocessingPolicy,
+    add_causal_dynamic_features,
     create_model_table,
     fit_preprocessor,
     load_frozen_benchmark,
@@ -80,7 +81,7 @@ def test_preprocessing_is_causal_and_train_fitted(tmp_path):
     assert table.loc[missing_index, "missing__PM2.5"] == 1.0
     assert table.loc[missing_index, "PM2.5_target_original"] != table.loc[missing_index, "PM2.5_target_original"]
     assert not table[artifacts.feature_columns].isna().any().any()
-    assert metadata["lookback_hours"] == 24
+    assert metadata["lookback_hours"] == 12
 
     train_mask = table["timestamp"] < pd.Timestamp("2016-01-01")
     scaled_train_mean = table.loc[train_mask, artifacts.scaled_columns].mean().abs().max()
@@ -158,8 +159,63 @@ def test_frozen_benchmark_cannot_load_before_selection_is_locked(tmp_path):
         load_frozen_benchmark(paths, selection)
 
     selection.write_text(
-        '{"selection_locked_before_benchmark": true, "source_fingerprint": "abc"}',
+        '{"selection_locked_before_benchmark": true, "validation_gate_passed": true, '
+        '"source_fingerprint": "abc"}',
         encoding="utf-8",
     )
     loaded = load_frozen_benchmark(paths, selection, expected_source_fingerprint="abc")
     assert len(loaded) == 4
+
+
+def test_dynamic_features_are_station_safe_causal_and_numerically_correct():
+    raw = synthetic_raw()
+    filled = raw.copy()
+    engineered = add_causal_dynamic_features(filled, "multivariate_dynamics")
+    station = EXPECTED_STATIONS[0]
+    rows = engineered.index[engineered["station"].eq(station)]
+    current = rows[6]
+    assert engineered.loc[current, "PM2.5_delta_1h"] == 1.0
+    assert engineered.loc[current, "PM2.5_delta_3h"] == 3.0
+    assert engineered.loc[current, "PM2.5_delta_6h"] == 6.0
+    assert engineered.loc[current, "PM10_delta_3h"] == 3.0
+    assert np.isclose(
+        engineered.loc[current, "PM2.5_roll_mean_3h"],
+        raw.loc[rows[4:7], "PM2.5"].mean(),
+    )
+    assert engineered.loc[rows[0], "PM2.5_delta_1h"] == 0.0
+
+    changed = filled.copy()
+    changed.loc[rows[10], "PM2.5"] = 100_000.0
+    changed_features = add_causal_dynamic_features(changed, "multivariate_dynamics")
+    feature_columns = [column for column in engineered if "delta" in column or "roll" in column]
+    np.testing.assert_allclose(
+        engineered.loc[rows[:10], feature_columns],
+        changed_features.loc[rows[:10], feature_columns],
+    )
+
+
+def test_engineered_scaler_is_fitted_only_on_training_period():
+    raw = synthetic_raw()
+    policy = PreprocessingPolicy(feature_policy="pm25_dynamics")
+    first = fit_preprocessor(raw, policy)
+    changed = raw.copy()
+    changed.loc[changed["timestamp"] >= pd.Timestamp(policy.fit_end_exclusive), "PM2.5"] = 1e6
+    second = fit_preprocessor(changed, policy)
+    np.testing.assert_allclose(first.scaler.mean_, second.scaler.mean_)
+    assert first.engineered_columns
+    assert all(column in first.scaled_source_columns for column in first.engineered_columns)
+
+
+def test_frozen_benchmark_rejects_locked_selection_when_gate_failed(tmp_path):
+    paths = ProjectPaths(tmp_path)
+    paths.ensure_directories()
+    benchmark = synthetic_raw().iloc[:4].copy()
+    benchmark["timestamp"] = pd.date_range("2016-08-01", periods=4, freq="h")
+    benchmark.to_parquet(paths.frozen_benchmark_parquet, index=False)
+    selection = paths.models / "final_model_selection.json"
+    selection.write_text(
+        '{"selection_locked_before_benchmark": true, "validation_gate_passed": false}',
+        encoding="utf-8",
+    )
+    with np.testing.assert_raises(PermissionError):
+        load_frozen_benchmark(paths, selection)

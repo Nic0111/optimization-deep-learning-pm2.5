@@ -74,3 +74,14 @@ def test_daily_persistence_is_exactly_24_hours_before_target():
     target_time = pd.to_datetime(frame.loc[0, "target_timestamp"])
     source_time = table.loc[table["PM2.5_input_raw"].eq(frame.loc[0, "daily_persistence"]), "timestamp"].iloc[0]
     assert target_time - source_time == pd.Timedelta(hours=24)
+
+
+def test_candidate_specific_batch_size_does_not_change_anchor_order():
+    table = sequence_table()
+    small = StationWindowSequence(
+        table, ["feature"], split="train", lookback=24, batch_size=2, shuffle=False
+    )
+    large = StationWindowSequence(
+        table, ["feature"], split="train", lookback=24, batch_size=256, shuffle=False
+    )
+    np.testing.assert_array_equal(small.ordered_anchor_indices(), large.ordered_anchor_indices())

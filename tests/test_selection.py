@@ -6,11 +6,13 @@ import numpy as np
 import pandas as pd
 
 from shared.data_pipeline import assign_split
-from shared.models import SerializableHuber, build_lstm
+from shared.models import SerializableHuber, SerializablePinball, build_lstm
 from shared.selection import (
     ROLLING_FOLDS,
     aggregate_validation_results,
+    generate_optimization_recipes,
     generate_lstm_candidates,
+    paired_comparison_table,
     select_lstm_candidate,
     validate_search_completeness,
 )
@@ -54,21 +56,51 @@ def test_candidate_search_is_deterministic_and_stratified():
     first = generate_lstm_candidates(42)
     second = generate_lstm_candidates(42)
     assert first == second
-    assert len(first) == 16
-    assert sum(item.formulation == "direct" for item in first) == 8
-    assert sum(item.formulation == "residual" for item in first) == 8
+    assert len(first) == 12
+    assert sum(item.formulation == "direct" for item in first) == 3
+    assert sum(item.formulation == "residual" for item in first) == 9
     assert first[0].source == "basic_anchor"
-    assert first[1].source == "previous_best_anchor"
+    assert first[1].source == "candidate13_anchor"
+    assert {item.units for item in first[2:]} == {64, 96, 128}
+    assert sum(item.batch_size == 128 for item in first[2:]) == 5
 
 
-def test_one_standard_error_selection_prefers_simpler_direct_model():
-    summary = pd.DataFrame(
-        [
-            {"candidate_id": "large", "mean_mae": 8.00, "se_mae": 0.10, "parameters": 1000, "num_layers": 2, "formulation": "residual"},
-            {"candidate_id": "small", "mean_mae": 8.08, "se_mae": 0.02, "parameters": 500, "num_layers": 1, "formulation": "direct"},
-        ]
-    )
-    assert select_lstm_candidate(summary)["candidate_id"] == "small"
+def test_paired_selection_does_not_use_unrelated_between_fold_variance():
+    rows = []
+    for fold, base in zip(("fold_1", "fold_2", "fold_3"), (7.0, 9.0, 11.0), strict=True):
+        for seed in (42, 52):
+            rows.extend(
+                [
+                    {
+                        "candidate_id": "large",
+                        "fold": fold,
+                        "seed": seed,
+                        "mae": base,
+                        "best_epoch": 4,
+                        "parameters": 1000,
+                        "num_layers": 2,
+                        "formulation": "residual",
+                    },
+                    {
+                        "candidate_id": "small",
+                        "fold": fold,
+                        "seed": seed,
+                        "mae": base + 0.08,
+                        "best_epoch": 4,
+                        "parameters": 500,
+                        "num_layers": 1,
+                        "formulation": "direct",
+                    },
+                ]
+            )
+    results = pd.DataFrame(rows)
+    summary = aggregate_validation_results(results)
+    selected, comparisons, audit = select_lstm_candidate(results, summary)
+    assert selected["candidate_id"] == "large"
+    assert comparisons.loc[
+        comparisons["candidate_id"].eq("small"), "paired_one_se_eligible"
+    ].item() is False
+    assert audit["raw_winner_by_mean_mae"] == "large"
 
 
 def test_zero_initialised_residual_model_begins_as_persistence():
@@ -133,7 +165,33 @@ def test_huber_delta_survives_save_load_and_resumed_training(tmp_path):
     assert np.isfinite(np.asarray(loss, dtype=float)).all()
 
 
-def test_full_search_contract_requires_exactly_96_unique_fits():
+def test_pinball_tau_half_matches_mae_and_survives_serialization(tmp_path):
+    from tensorflow import keras
+
+    y_true = np.array([[1.0], [5.0]], dtype=np.float32)
+    y_pred = np.array([[3.0], [2.0]], dtype=np.float32)
+    pinball = SerializablePinball(tau=0.5)
+    assert np.isclose(float(pinball(y_true, y_pred)), np.abs(y_true - y_pred).mean())
+    model = build_lstm(
+        (4, 1),
+        units=2,
+        dense_units=2,
+        dropout=0.0,
+        loss_name="pinball",
+        pinball_tau=0.55,
+        clipnorm=1.0,
+        use_ema=True,
+    )
+    path = tmp_path / "pinball.keras"
+    model.save(path)
+    restored = keras.models.load_model(path)
+    assert isinstance(restored.loss, SerializablePinball)
+    assert restored.loss.tau == 0.55
+    assert restored.optimizer.clipnorm == 1.0
+    assert restored.optimizer.use_ema is True
+
+
+def test_full_search_contract_requires_exactly_72_unique_fits():
     candidates = [item.candidate_id for item in generate_lstm_candidates(42)]
     folds = [fold.name for fold in ROLLING_FOLDS]
     rows = [
@@ -150,8 +208,49 @@ def test_full_search_contract_requires_exactly_96_unique_fits():
     validated = validate_search_completeness(
         pd.DataFrame(rows), candidates, folds, (42, 52), source_fingerprint="source"
     )
-    assert len(validated) == 96
+    assert len(validated) == 72
     with np.testing.assert_raises(ValueError):
         validate_search_completeness(
             pd.DataFrame(rows[:-1]), candidates, folds, (42, 52), source_fingerprint="source"
         )
+
+
+def test_optimization_recipe_contract_is_complete_and_preregistered():
+    recipes = generate_optimization_recipes()
+    assert len(recipes) == 6
+    assert recipes[0].source == "candidate13_reproduction"
+    assert recipes[4].loss_name == "pinball" and recipes[4].pinball_tau == 0.55
+    assert recipes[5].optimizer_name == "adamw" and recipes[5].weight_decay == 1e-5
+    rows = [
+        {
+            "candidate_id": recipe.candidate_id,
+            "fold": fold.name,
+            "seed": seed,
+            "source_fingerprint": "source",
+        }
+        for recipe in recipes
+        for fold in ROLLING_FOLDS
+        for seed in (42, 52)
+    ]
+    validated = validate_search_completeness(
+        pd.DataFrame(rows),
+        [recipe.candidate_id for recipe in recipes],
+        [fold.name for fold in ROLLING_FOLDS],
+        (42, 52),
+        source_fingerprint="source",
+    )
+    assert len(validated) == 36
+
+
+def test_paired_comparison_averages_seeds_before_fold_uncertainty():
+    rows = []
+    for fold, difference in zip(("fold_1", "fold_2", "fold_3"), (0.01, 0.02, 0.03), strict=True):
+        for seed in (42, 52):
+            rows.append({"candidate_id": "best", "fold": fold, "seed": seed, "mae": 8.0})
+            rows.append(
+                {"candidate_id": "other", "fold": fold, "seed": seed, "mae": 8.0 + difference}
+            )
+    table = paired_comparison_table(pd.DataFrame(rows))
+    other = table.loc[table["candidate_id"].eq("other")].iloc[0]
+    assert np.isclose(other["mean_paired_degradation"], 0.02)
+    assert np.isclose(other["paired_standard_error"], 0.01 / np.sqrt(3))

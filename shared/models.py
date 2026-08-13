@@ -82,14 +82,87 @@ class SerializableHuber(keras.losses.Loss):
         return {**super().get_config(), "delta": self.delta}
 
 
+@keras.utils.register_keras_serializable(package="odl")
+class SerializablePinball(keras.losses.Loss):
+    """Scaled pinball loss; tau=0.5 is exactly mean absolute error."""
+
+    def __init__(
+        self,
+        tau: float = 0.5,
+        reduction: str = "sum_over_batch_size",
+        name: str = "pinball",
+    ) -> None:
+        if not 0.0 < tau < 1.0:
+            raise ValueError("Pinball tau must be strictly between zero and one.")
+        super().__init__(reduction=reduction, name=name)
+        self.tau = float(tau)
+
+    def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+        error = tf.cast(y_true, self.dtype) - tf.cast(y_pred, self.dtype)
+        return 2.0 * tf.maximum(self.tau * error, (self.tau - 1.0) * error)
+
+    def get_config(self) -> dict[str, Any]:
+        return {**super().get_config(), "tau": self.tau}
+
+
+def _loss(loss_name: str, huber_delta: float, pinball_tau: float) -> keras.losses.Loss:
+    if loss_name == "huber":
+        return SerializableHuber(delta=huber_delta)
+    if loss_name == "mae":
+        return keras.losses.MeanAbsoluteError(name="mae_loss")
+    if loss_name == "pinball":
+        return SerializablePinball(tau=pinball_tau)
+    raise ValueError(f"Unknown loss: {loss_name}")
+
+
+def _optimizer(
+    optimizer_name: str,
+    learning_rate: float,
+    *,
+    weight_decay: float,
+    clipnorm: float | None,
+    use_ema: bool,
+    ema_momentum: float,
+) -> keras.optimizers.Optimizer:
+    common = {
+        "learning_rate": learning_rate,
+        "clipnorm": clipnorm,
+        "use_ema": use_ema,
+        "ema_momentum": ema_momentum,
+    }
+    if optimizer_name == "adam":
+        return keras.optimizers.Adam(
+            weight_decay=weight_decay if weight_decay else None,
+            **common,
+        )
+    if optimizer_name == "adamw":
+        return keras.optimizers.AdamW(weight_decay=weight_decay, **common)
+    raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+
 def _compile(
     model: keras.Model,
     learning_rate: float,
     huber_delta: float = CONFIG.huber_delta,
+    *,
+    loss_name: str = "huber",
+    pinball_tau: float = 0.5,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    clipnorm: float | None = None,
+    use_ema: bool = False,
+    ema_momentum: float = 0.99,
 ) -> keras.Model:
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=SerializableHuber(delta=huber_delta),
+        optimizer=_optimizer(
+            optimizer_name,
+            learning_rate,
+            weight_decay=weight_decay,
+            clipnorm=clipnorm,
+            use_ema=use_ema,
+            ema_momentum=ema_momentum,
+        ),
+        loss=_loss(loss_name, huber_delta, pinball_tau),
         metrics=[
             keras.metrics.MeanAbsoluteError(name="mae"),
             keras.metrics.RootMeanSquaredError(name="rmse"),
@@ -107,6 +180,13 @@ def build_lstm(
     l2_strength: float = 0.0,
     num_layers: int = 1,
     huber_delta: float = CONFIG.huber_delta,
+    loss_name: str = "huber",
+    pinball_tau: float = 0.5,
+    optimizer_name: str = "adam",
+    weight_decay: float = 0.0,
+    clipnorm: float | None = None,
+    use_ema: bool = False,
+    ema_momentum: float = 0.99,
     formulation: str = "direct",
     pm25_feature_index: int = 0,
     pm25_mean: float = 0.0,
@@ -147,6 +227,13 @@ def build_lstm(
         keras.Model(inputs, outputs, name=f"lstm_{formulation}_forecaster"),
         learning_rate,
         huber_delta,
+        loss_name=loss_name,
+        pinball_tau=pinball_tau,
+        optimizer_name=optimizer_name,
+        weight_decay=weight_decay,
+        clipnorm=clipnorm,
+        use_ema=use_ema,
+        ema_momentum=ema_momentum,
     )
 
 

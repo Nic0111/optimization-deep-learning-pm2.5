@@ -228,7 +228,7 @@ RAW_COLUMNS = (
 class ExperimentConfig:
     """Experiment constants that must not drift between notebooks."""
 
-    methodology_version: str = "v2.1-audited-2026-08"
+    methodology_version: str = "v2.2-focused-lstm-2026-08"
     source_url: str = (
         "https://archive.ics.uci.edu/static/public/501/"
         "beijing%2Bmulti%2Bsite%2Bair%2Bquality%2Bdata.zip"
@@ -243,7 +243,7 @@ class ExperimentConfig:
     validation_start: str = "2016-01-01 00:00:00"
     test_start: str = "2016-08-01 00:00:00"
     data_end_exclusive: str = "2017-03-01 00:00:00"
-    lookback_hours: int = 24
+    lookback_hours: int = 12
     forward_fill_limit_hours: int = 24
     forecast_horizon: int = 1
     seed: int = 42
@@ -252,8 +252,10 @@ class ExperimentConfig:
     early_stopping_patience: int = 5
     cnn_max_epochs: int = 60
     cnn_early_stopping_patience: int = 8
-    random_search_candidates: int = 16
+    random_search_candidates: int = 12
     huber_delta: float = 10.0
+    focused_max_epochs: int = 40
+    focused_early_stopping_patience: int = 6
     run_mode: Literal["smoke", "full"] = "full"
 
     def to_dict(self) -> dict:

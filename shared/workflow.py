@@ -25,6 +25,8 @@ from .config import (
     ProjectPaths,
 )
 from .data_pipeline import (
+    FEATURE_POLICIES,
+    FeaturePolicyName,
     PreprocessingPolicy,
     create_model_table,
     download_dataset,
@@ -57,8 +59,9 @@ from .selection import (
     LSTMConfig,
     ROLLING_FOLDS,
     aggregate_validation_results,
+    generate_optimization_recipes,
     generate_lstm_candidates,
-    selection_audit,
+    select_paired_one_standard_error,
     select_lstm_candidate,
     select_one_standard_error,
     validate_search_completeness,
@@ -115,7 +118,12 @@ def _persist_model_inputs(
     joblib.dump(artifacts, preprocessor_path)
     write_json_atomic(
         feature_path,
-        {"features": artifacts.feature_columns, "count": len(artifacts.feature_columns)},
+        {
+            "features": artifacts.feature_columns,
+            "count": len(artifacts.feature_columns),
+            "feature_policy": artifacts.feature_policy,
+            "engineered_features": artifacts.engineered_columns,
+        },
     )
     write_json_atomic(split_path, metadata)
     return model_path, feature_path, split_path, preprocessor_path
@@ -499,6 +507,9 @@ def _fold_inputs(
     options: RuntimeOptions,
     paths: ProjectPaths,
     source_fingerprint: str | None = None,
+    feature_policy: FeaturePolicyName = "base",
+    batch_size: int | None = None,
+    seed: int = CONFIG.seed,
 ) -> tuple[pd.DataFrame, Any, dict[str, Any], dict[str, Any]]:
     subset = raw_data[raw_data["timestamp"] < pd.Timestamp(fold.validation_end)].copy()
     table, artifacts, metadata = create_model_table(
@@ -510,6 +521,7 @@ def _fold_inputs(
         data_end_exclusive=fold.validation_end,
         lookback_hours=lookback,
         forward_fill_limit_hours=fill_limit,
+        feature_policy=feature_policy,
         persist=False,
         source_fingerprint=source_fingerprint,
     )
@@ -517,15 +529,15 @@ def _fold_inputs(
         table,
         artifacts.feature_columns,
         lookback,
-        options.batch_size,
-        CONFIG.seed,
+        batch_size or options.batch_size,
+        seed,
         splits=("train", "validation"),
     )
     return table, artifacts, metadata, sequences
 
 
 def _scaler_values(artifacts: Any) -> tuple[int, float, float]:
-    index = artifacts.continuous_columns.index("PM2.5")
+    index = artifacts.scaled_source_columns.index("PM2.5")
     feature_index = artifacts.feature_columns.index("z__PM2.5")
     return feature_index, float(artifacts.scaler.mean_[index]), float(artifacts.scaler.scale_[index])
 
@@ -594,6 +606,34 @@ def _already_done(frame: pd.DataFrame, **values: Any) -> bool:
     return bool(mask.any())
 
 
+def _validate_named_completeness(
+    results: pd.DataFrame,
+    *,
+    item_column: str,
+    item_ids: tuple[str, ...],
+    fold_names: tuple[str, ...],
+    seeds: tuple[int, ...],
+    source_fingerprint: str,
+) -> pd.DataFrame:
+    """Validate a named fit grid without retaining an unrelated candidate identifier."""
+
+    working = results.copy()
+    if item_column != "candidate_id":
+        working = working.drop(columns=["candidate_id"], errors="ignore").rename(
+            columns={item_column: "candidate_id"}
+        )
+    validated = validate_search_completeness(
+        working,
+        item_ids,
+        fold_names,
+        seeds,
+        source_fingerprint=source_fingerprint,
+    )
+    if item_column != "candidate_id":
+        validated = validated.rename(columns={"candidate_id": item_column})
+    return validated
+
+
 def _ablation_summary(results: pd.DataFrame, column: str) -> pd.DataFrame:
     summary = (
         results.groupby(column, observed=True)["mae"]
@@ -635,7 +675,7 @@ def baselines_stage(
     paths: ProjectPaths,
     store: RunStateStore,
 ) -> tuple[dict[str, Any], list[Path]]:
-    """Select preprocessing by rolling validation and fit fair basic models."""
+    """Select causal features by paired validation and fit fair basic models."""
 
     from tensorflow import keras
 
@@ -644,109 +684,122 @@ def baselines_stage(
     suffix = options.artifact_suffix
     raw_data = _modeling_data(options, paths)
     folds = _folds(options)
+    seeds = (42, 52) if options.mode == "full" else (42,)
+    selected_fill = 24
+    selected_lookback = 12
     max_epochs = 1 if options.mode == "smoke" else CONFIG.max_epochs
+    policies = list(FEATURE_POLICIES)
 
-    fill_path = paths.assignment2_tables / f"forward_fill_ablation{suffix}.csv"
-    fill_results = _initial_progress(fill_path, resume=options.resume)
-    fill_candidates: list[int | None] = [24] if options.mode == "smoke" else [6, 24, None]
-    for fill_limit in fill_candidates:
-        label = "unlimited" if fill_limit is None else str(fill_limit)
-        for fold in folds:
-            if _already_done(
-                fill_results,
-                fill_limit=label,
-                fold=fold.name,
-                source_fingerprint=store.source_fingerprint,
-            ):
-                continue
-            table, artifacts, _, sequences = _fold_inputs(
-                raw_data, fold, fill_limit, 24, options, paths, store.source_fingerprint
-            )
-            anchors = sequences["validation"].ordered_anchor_indices()
-            set_global_determinism(CONFIG.seed)
-            model = build_lstm((24, len(artifacts.feature_columns)))
-            result = _fit_validation(
-                model,
-                sequences,
-                table.loc[anchors, "target_pm25"].to_numpy(),
-                max_epochs=max_epochs,
-                patience=CONFIG.early_stopping_patience,
-            )
-            fill_results = _append_progress(
-                fill_path,
-                {
-                    "fill_limit": label,
-                    "fold": fold.name,
-                    "seed": CONFIG.seed,
-                    "source_fingerprint": store.source_fingerprint,
-                    **result,
-                },
-                ["fill_limit", "fold", "seed"],
-            )
-            keras.backend.clear_session()
-    fill_summary = _ablation_summary(fill_results, "fill_limit")
-    fill_summary["preference_rank"] = fill_summary["fill_limit"].map(
-        {"24": 0, "6": 1, "unlimited": 2}
+    preprocessing_lock_path = paths.processed / f"preprocessing_lock{suffix}.json"
+    write_json_atomic(
+        preprocessing_lock_path,
+        {
+            "forward_fill_limit_hours": selected_fill,
+            "lookback_hours": selected_lookback,
+            "basis": "V2.1 rolling-validation ablations; held fixed for focused V2.2",
+            "source_fingerprint": store.source_fingerprint,
+        },
     )
-    selected_fill_row = select_one_standard_error(
-        fill_summary, simplicity_columns=("preference_rank",)
-    )
-    selected_fill_label = str(selected_fill_row["fill_limit"])
-    selected_fill = None if selected_fill_label == "unlimited" else int(selected_fill_label)
-    fill_summary_path = paths.assignment2_tables / f"forward_fill_ablation_summary{suffix}.csv"
-    _write_frame(fill_summary, fill_summary_path)
 
-    lookback_path = paths.assignment2_tables / f"lookback_ablation{suffix}.csv"
-    lookback_results = _initial_progress(lookback_path, resume=options.resume)
-    lookback_candidates = [24] if options.mode == "smoke" else [12, 24, 48]
-    for lookback in lookback_candidates:
-        for fold in folds:
-            if _already_done(
-                lookback_results,
-                lookback=lookback,
-                fold=fold.name,
-                source_fingerprint=store.source_fingerprint,
-            ):
-                continue
-            table, artifacts, _, sequences = _fold_inputs(
-                raw_data, fold, selected_fill, lookback, options, paths, store.source_fingerprint
+    feature_path = paths.assignment2_tables / f"feature_policy_ablation{suffix}.csv"
+    feature_results = _initial_progress(feature_path, resume=options.resume)
+    for fold in folds:
+        for policy_name in policies:
+            table, artifacts, _, _ = _fold_inputs(
+                raw_data,
+                fold,
+                selected_fill,
+                selected_lookback,
+                options,
+                paths,
+                store.source_fingerprint,
+                feature_policy=policy_name,
             )
-            anchors = sequences["validation"].ordered_anchor_indices()
-            set_global_determinism(CONFIG.seed)
-            model = build_lstm((lookback, len(artifacts.feature_columns)))
-            result = _fit_validation(
-                model,
-                sequences,
-                table.loc[anchors, "target_pm25"].to_numpy(),
-                max_epochs=max_epochs,
-                patience=CONFIG.early_stopping_patience,
-            )
-            lookback_results = _append_progress(
-                lookback_path,
-                {
-                    "lookback": lookback,
-                    "fold": fold.name,
-                    "seed": CONFIG.seed,
-                    "source_fingerprint": store.source_fingerprint,
-                    **result,
-                },
-                ["lookback", "fold", "seed"],
-            )
-            keras.backend.clear_session()
-    lookback_summary = _ablation_summary(lookback_results, "lookback")
-    selected_lookback_row = select_one_standard_error(
-        lookback_summary, simplicity_columns=("lookback",)
+            for seed in seeds:
+                if _already_done(
+                    feature_results,
+                    candidate_id=policy_name,
+                    fold=fold.name,
+                    seed=seed,
+                    source_fingerprint=store.source_fingerprint,
+                ):
+                    continue
+                sequences = build_sequences(
+                    table,
+                    artifacts.feature_columns,
+                    selected_lookback,
+                    options.batch_size,
+                    seed,
+                    splits=("train", "validation"),
+                )
+                anchors = sequences["validation"].ordered_anchor_indices()
+                set_global_determinism(seed)
+                model = build_lstm((selected_lookback, len(artifacts.feature_columns)))
+                result = _fit_validation(
+                    model,
+                    sequences,
+                    table.loc[anchors, "target_pm25"].to_numpy(),
+                    max_epochs=max_epochs,
+                    patience=CONFIG.early_stopping_patience,
+                )
+                feature_results = _append_progress(
+                    feature_path,
+                    {
+                        "candidate_id": policy_name,
+                        "feature_policy": policy_name,
+                        "complexity_rank": policies.index(policy_name),
+                        "fold": fold.name,
+                        "seed": seed,
+                        "num_layers": 1,
+                        "formulation": "direct",
+                        "source_fingerprint": store.source_fingerprint,
+                        **result,
+                    },
+                    ["candidate_id", "fold", "seed"],
+                )
+                keras.backend.clear_session()
+    feature_results = validate_search_completeness(
+        feature_results,
+        policies,
+        [fold.name for fold in folds],
+        seeds,
+        source_fingerprint=store.source_fingerprint,
     )
-    selected_lookback = int(selected_lookback_row["lookback"])
-    lookback_summary_path = paths.assignment2_tables / f"lookback_ablation_summary{suffix}.csv"
-    _write_frame(lookback_summary, lookback_summary_path)
+    _write_frame(feature_results, feature_path)
+    feature_summary = aggregate_validation_results(feature_results)
+    feature_summary["feature_policy"] = feature_summary["candidate_id"]
+    feature_summary["complexity_rank"] = feature_summary["feature_policy"].map(
+        {name: rank for rank, name in enumerate(policies)}
+    )
+    selected_feature_row, feature_comparisons, feature_audit = select_paired_one_standard_error(
+        feature_results,
+        feature_summary,
+        item_column="candidate_id",
+        simplicity_columns=("complexity_rank",),
+    )
+    selected_feature = str(selected_feature_row["feature_policy"])
+    feature_summary_path = paths.assignment2_tables / f"feature_policy_ablation_summary{suffix}.csv"
+    feature_audit_path = paths.assignment2_tables / f"feature_policy_paired_audit{suffix}.csv"
+    _write_frame(feature_summary, feature_summary_path)
+    _write_frame(feature_comparisons, feature_audit_path)
 
     rolling_path = paths.assignment2_tables / f"basic_rolling_results{suffix}.csv"
     rolling_results = _initial_progress(rolling_path, resume=options.resume)
+    selected_feature_results = feature_results.loc[
+        feature_results["candidate_id"].eq(selected_feature)
+    ]
+    for row in selected_feature_results.to_dict(orient="records"):
+        row.pop("candidate_id", None)
+        rolling_results = _append_progress(
+            rolling_path,
+            {**row, "model": "lstm"},
+            ["model", "fold", "seed"],
+        )
+
     persistence_rows: list[dict[str, Any]] = []
     fold_metadata: list[dict[str, Any]] = []
     for fold in folds:
-        table, artifacts, metadata, sequences = _fold_inputs(
+        table, artifacts, metadata, _ = _fold_inputs(
             raw_data,
             fold,
             selected_fill,
@@ -754,51 +807,70 @@ def baselines_stage(
             options,
             paths,
             store.source_fingerprint,
+            feature_policy=selected_feature,
         )
         fold_metadata.append(
             {
                 **fold.to_dict(),
                 "lookback_hours": selected_lookback,
                 "forward_fill_limit_hours": selected_fill,
+                "feature_policy": selected_feature,
                 "split_counts": metadata["split_counts"],
                 "preprocessing_fit": metadata["preprocessing_fit"],
             }
         )
-        anchors = sequences["validation"].ordered_anchor_indices()
+        reference_sequences = build_sequences(
+            table,
+            artifacts.feature_columns,
+            selected_lookback,
+            options.batch_size,
+            CONFIG.seed,
+            splits=("train", "validation"),
+        )
+        anchors = reference_sequences["validation"].ordered_anchor_indices()
         targets = table.loc[anchors, "target_pm25"].to_numpy()
         baseline = prediction_frame(
             table,
-            sequences["validation"],
+            reference_sequences["validation"],
             table.loc[anchors, "PM2.5_input_raw"].to_numpy(),
         )
         for name in ("persistence", "daily_persistence"):
             persistence_rows.append(
                 {"fold": fold.name, "model": name, **regression_metrics(targets, baseline[name])}
             )
-        for name in ("lstm", "cnn"):
+        for seed in seeds:
             if _already_done(
                 rolling_results,
-                model=name,
+                model="cnn",
                 fold=fold.name,
+                seed=seed,
                 source_fingerprint=store.source_fingerprint,
             ):
                 continue
-            set_global_determinism(CONFIG.seed)
-            input_shape = (selected_lookback, len(artifacts.feature_columns))
-            model = build_lstm(input_shape) if name == "lstm" else build_cnn(input_shape)
+            sequences = build_sequences(
+                table,
+                artifacts.feature_columns,
+                selected_lookback,
+                options.batch_size,
+                seed,
+                splits=("train", "validation"),
+            )
+            set_global_determinism(seed)
+            model = build_cnn((selected_lookback, len(artifacts.feature_columns)))
             result = _fit_validation(
                 model,
                 sequences,
                 targets,
-                max_epochs=(1 if options.mode == "smoke" else (CONFIG.max_epochs if name == "lstm" else CONFIG.cnn_max_epochs)),
-                patience=(CONFIG.early_stopping_patience if name == "lstm" else CONFIG.cnn_early_stopping_patience),
+                max_epochs=(1 if options.mode == "smoke" else CONFIG.cnn_max_epochs),
+                patience=CONFIG.cnn_early_stopping_patience,
             )
             rolling_results = _append_progress(
                 rolling_path,
                 {
-                    "model": name,
+                    "model": "cnn",
                     "fold": fold.name,
-                    "seed": CONFIG.seed,
+                    "seed": seed,
+                    "feature_policy": selected_feature,
                     "source_fingerprint": store.source_fingerprint,
                     **result,
                 },
@@ -806,11 +878,27 @@ def baselines_stage(
             )
             keras.backend.clear_session()
 
+    expected_models = ("lstm", "cnn")
+    validated_rolling = _validate_named_completeness(
+        rolling_results,
+        item_column="model",
+        item_ids=expected_models,
+        fold_names=tuple(fold.name for fold in folds),
+        seeds=seeds,
+        source_fingerprint=store.source_fingerprint,
+    )
+    rolling_results = validated_rolling
+    _write_frame(rolling_results, rolling_path)
     baseline_metrics_path = paths.assignment2_tables / f"validation_baseline_metrics{suffix}.csv"
     baseline_metrics = (
         pd.DataFrame(persistence_rows)
         .groupby("model", observed=True)
-        .agg(mae=("mae", "mean"), rmse=("rmse", "mean"), r2=("r2", "mean"), smape_percent=("smape_percent", "mean"))
+        .agg(
+            mae=("mae", "mean"),
+            rmse=("rmse", "mean"),
+            r2=("r2", "mean"),
+            smape_percent=("smape_percent", "mean"),
+        )
         .reset_index()
     )
     _write_frame(baseline_metrics, baseline_metrics_path)
@@ -846,7 +934,9 @@ def baselines_stage(
     selected_payload = {
         "forward_fill_limit_hours": selected_fill,
         "lookback_hours": selected_lookback,
-        "selection_rule": "lowest mean rolling MAE with one-standard-error simplicity rule",
+        "feature_policy": selected_feature,
+        "selection_rule": "paired fold-level one-standard-error feature selection",
+        "feature_selection_audit": feature_audit,
         "run_mode": options.mode,
         "config_hash": options.stable_hash(),
         "source_fingerprint": store.source_fingerprint,
@@ -872,6 +962,7 @@ def baselines_stage(
         data_end_exclusive=CONFIG.test_start,
         lookback_hours=selected_lookback,
         forward_fill_limit_hours=selected_fill,
+        feature_policy=selected_feature,
         persist=False,
         source_fingerprint=store.source_fingerprint,
     )
@@ -892,7 +983,14 @@ def baselines_stage(
     )
     final_seconds: dict[str, float] = {}
     for name in ("lstm", "cnn"):
-        epochs = int(max(1, np.ceil(comparison.loc[comparison["model"].eq(name), "median_best_epoch"].iloc[0])))
+        epochs = int(
+            max(
+                1,
+                np.ceil(
+                    comparison.loc[comparison["model"].eq(name), "median_best_epoch"].iloc[0]
+                ),
+            )
+        )
         set_global_determinism(CONFIG.seed)
         input_shape = (selected_lookback, len(final_artifacts.feature_columns))
         model = build_lstm(input_shape) if name == "lstm" else build_cnn(input_shape)
@@ -909,14 +1007,14 @@ def baselines_stage(
         plot_history(
             history.assign(val_mae=np.nan, val_loss=np.nan),
             paths.assignment2_figures / f"basic_{name}_training{suffix}.png",
-            f"Basic {name.upper()} final pre-test training",
+            f"Basic {name.upper()} final pre-benchmark training",
         )
         keras.backend.clear_session()
     outputs = [
-        fill_path,
-        fill_summary_path,
-        lookback_path,
-        lookback_summary_path,
+        preprocessing_lock_path,
+        feature_path,
+        feature_summary_path,
+        feature_audit_path,
         rolling_path,
         baseline_metrics_path,
         comparison_path,
@@ -935,6 +1033,8 @@ def baselines_stage(
         "selected_model": selected_model,
         "selected_forward_fill_limit_hours": selected_fill,
         "selected_lookback_hours": selected_lookback,
+        "selected_feature_policy": selected_feature,
+        "feature_validation_fits": len(feature_results),
         "rolling_validation_mae": float(comparison.iloc[0]["mae"]),
         "final_training_seconds": final_seconds,
         "folds": len(folds),
@@ -959,6 +1059,13 @@ def _build_candidate_model(
         l2_strength=candidate.l2_strength,
         num_layers=candidate.num_layers,
         huber_delta=candidate.huber_delta,
+        loss_name=candidate.loss_name,
+        pinball_tau=candidate.pinball_tau,
+        optimizer_name=candidate.optimizer_name,
+        weight_decay=candidate.weight_decay,
+        clipnorm=candidate.clipnorm,
+        use_ema=candidate.use_ema,
+        ema_momentum=candidate.ema_momentum,
         formulation=candidate.formulation,
         pm25_feature_index=feature_index,
         pm25_mean=pm25_mean,
@@ -971,7 +1078,7 @@ def tune_stage(
     paths: ProjectPaths,
     store: RunStateStore,
 ) -> tuple[dict[str, Any], list[Path]]:
-    """Run repeated-seed stratified random search over rolling folds."""
+    """Compare optimization recipes, run the focused search, and enforce the gate."""
 
     import joblib
     from tensorflow import keras
@@ -985,16 +1092,17 @@ def tune_stage(
         raise RuntimeError("Selected preprocessing belongs to different methodology source.")
     selected_lookback = int(selected_preprocessing["lookback_hours"])
     selected_fill = selected_preprocessing["forward_fill_limit_hours"]
+    selected_feature: FeaturePolicyName = selected_preprocessing["feature_policy"]
     raw_data = _modeling_data(options, paths)
-    all_candidates = generate_lstm_candidates(CONFIG.seed, CONFIG.random_search_candidates)
-    candidates = all_candidates if options.mode == "full" else [all_candidates[0], all_candidates[8]]
     seeds = (42, 52) if options.mode == "full" else (42,)
     folds = _folds(options)
-    max_epochs = 1 if options.mode == "smoke" else CONFIG.max_epochs
-    search_path = paths.assignment2_tables / f"random_search_rolling_results{suffix}.csv"
-    results = _initial_progress(search_path, resume=options.resume)
+    max_epochs = 1 if options.mode == "smoke" else CONFIG.focused_max_epochs
+
+    recipes = generate_optimization_recipes()
+    recipe_path = paths.assignment2_tables / f"optimization_recipe_results{suffix}.csv"
+    recipe_results = _initial_progress(recipe_path, resume=options.resume)
     for fold in folds:
-        table, artifacts, _, sequences = _fold_inputs(
+        table, artifacts, _, _ = _fold_inputs(
             raw_data,
             fold,
             selected_fill,
@@ -1002,9 +1110,112 @@ def tune_stage(
             options,
             paths,
             store.source_fingerprint,
+            feature_policy=selected_feature,
         )
-        anchors = sequences["validation"].ordered_anchor_indices()
-        targets = table.loc[anchors, "target_pm25"].to_numpy()
+        for recipe in recipes:
+            for seed in seeds:
+                if _already_done(
+                    recipe_results,
+                    candidate_id=recipe.candidate_id,
+                    fold=fold.name,
+                    seed=seed,
+                    source_fingerprint=store.source_fingerprint,
+                ):
+                    continue
+                sequences = build_sequences(
+                    table,
+                    artifacts.feature_columns,
+                    selected_lookback,
+                    recipe.batch_size,
+                    seed,
+                    splits=("train", "validation"),
+                )
+                anchors = sequences["validation"].ordered_anchor_indices()
+                set_global_determinism(seed)
+                model = _build_candidate_model(
+                    recipe,
+                    (selected_lookback, len(artifacts.feature_columns)),
+                    artifacts,
+                )
+                fit = _fit_validation(
+                    model,
+                    sequences,
+                    table.loc[anchors, "target_pm25"].to_numpy(),
+                    max_epochs=max_epochs,
+                    patience=CONFIG.focused_early_stopping_patience,
+                )
+                recipe_results = _append_progress(
+                    recipe_path,
+                    {
+                        **recipe.to_dict(),
+                        "fold": fold.name,
+                        "seed": seed,
+                        "feature_policy": selected_feature,
+                        "source_fingerprint": store.source_fingerprint,
+                        **fit,
+                    },
+                    ["candidate_id", "fold", "seed"],
+                )
+                keras.backend.clear_session()
+    recipe_results = validate_search_completeness(
+        recipe_results,
+        [recipe.candidate_id for recipe in recipes],
+        [fold.name for fold in folds],
+        seeds,
+        source_fingerprint=store.source_fingerprint,
+    )
+    _write_frame(recipe_results, recipe_path)
+    recipe_summary = aggregate_validation_results(recipe_results)
+    recipe_summary["symmetric_loss_rank"] = recipe_summary["candidate_id"].map(
+        {recipe.candidate_id: int(recipe.loss_name == "pinball") for recipe in recipes}
+    )
+    recipe_summary["optimizer_rank"] = recipe_summary["candidate_id"].map(
+        {recipe.candidate_id: int(recipe.optimizer_name == "adamw") for recipe in recipes}
+    )
+    recipe_summary["mechanism_rank"] = recipe_summary["candidate_id"].map(
+        {
+            recipe.candidate_id: int(recipe.clipnorm is not None)
+            + int(recipe.use_ema)
+            + int(recipe.weight_decay > 0)
+            for recipe in recipes
+        }
+    )
+    selected_recipe_row, recipe_comparisons, recipe_audit = select_paired_one_standard_error(
+        recipe_results,
+        recipe_summary,
+        item_column="candidate_id",
+        simplicity_columns=(),
+        preference_columns=("symmetric_loss_rank", "optimizer_rank", "mechanism_rank"),
+    )
+    selected_recipe = next(
+        recipe
+        for recipe in recipes
+        if recipe.candidate_id == selected_recipe_row["candidate_id"]
+    )
+    recipe_summary_path = paths.assignment2_tables / f"optimization_recipe_summary{suffix}.csv"
+    recipe_audit_path = paths.assignment2_tables / f"optimization_recipe_paired_audit{suffix}.csv"
+    _write_frame(recipe_summary, recipe_summary_path)
+    _write_frame(recipe_comparisons, recipe_audit_path)
+
+    all_candidates = generate_lstm_candidates(
+        CONFIG.seed,
+        CONFIG.random_search_candidates,
+        recipe=selected_recipe,
+    )
+    candidates = all_candidates if options.mode == "full" else all_candidates[:2]
+    search_path = paths.assignment2_tables / f"focused_lstm_search_results{suffix}.csv"
+    results = _initial_progress(search_path, resume=options.resume)
+    for fold in folds:
+        table, artifacts, _, _ = _fold_inputs(
+            raw_data,
+            fold,
+            selected_fill,
+            selected_lookback,
+            options,
+            paths,
+            store.source_fingerprint,
+            feature_policy=selected_feature,
+        )
         for candidate in candidates:
             for seed in seeds:
                 if _already_done(
@@ -1015,6 +1226,15 @@ def tune_stage(
                     source_fingerprint=store.source_fingerprint,
                 ):
                     continue
+                sequences = build_sequences(
+                    table,
+                    artifacts.feature_columns,
+                    selected_lookback,
+                    candidate.batch_size,
+                    seed,
+                    splits=("train", "validation"),
+                )
+                anchors = sequences["validation"].ordered_anchor_indices()
                 set_global_determinism(seed)
                 model = _build_candidate_model(
                     candidate,
@@ -1024,9 +1244,9 @@ def tune_stage(
                 fit = _fit_validation(
                     model,
                     sequences,
-                    targets,
+                    table.loc[anchors, "target_pm25"].to_numpy(),
                     max_epochs=max_epochs,
-                    patience=CONFIG.early_stopping_patience,
+                    patience=CONFIG.focused_early_stopping_patience,
                 )
                 results = _append_progress(
                     search_path,
@@ -1034,6 +1254,8 @@ def tune_stage(
                         **candidate.to_dict(),
                         "fold": fold.name,
                         "seed": seed,
+                        "feature_policy": selected_feature,
+                        "selected_recipe_id": selected_recipe.candidate_id,
                         "source_fingerprint": store.source_fingerprint,
                         **fit,
                     },
@@ -1047,14 +1269,64 @@ def tune_stage(
         seeds,
         source_fingerprint=store.source_fingerprint,
     )
+    _write_frame(results, search_path)
     summary = aggregate_validation_results(results)
-    summary_path = paths.assignment2_tables / f"random_search_summary{suffix}.csv"
+    summary_path = paths.assignment2_tables / f"focused_lstm_search_summary{suffix}.csv"
+    selected_row, candidate_comparisons, candidate_audit = select_lstm_candidate(results, summary)
+    candidate_audit_path = paths.assignment2_tables / f"focused_lstm_paired_audit{suffix}.csv"
     _write_frame(summary, summary_path)
-    selected_row = select_lstm_candidate(summary)
-    audit = selection_audit(summary, selected_row)
+    _write_frame(candidate_comparisons, candidate_audit_path)
     selected_candidate = next(
         candidate for candidate in candidates if candidate.candidate_id == selected_row["candidate_id"]
     )
+
+    basic_path = paths.assignment2_tables / f"basic_rolling_results{suffix}.csv"
+    basic_results = pd.read_csv(basic_path)
+    basic_results = basic_results.loc[
+        basic_results["model"].eq("lstm")
+        & basic_results["source_fingerprint"].eq(store.source_fingerprint)
+    ].copy()
+    tuned_fold = results.loc[results["candidate_id"].eq(selected_candidate.candidate_id)].groupby(
+        "fold", observed=True
+    )["mae"].mean()
+    basic_fold = basic_results.groupby("fold", observed=True)["mae"].mean()
+    paired_gate = pd.concat(
+        [tuned_fold.rename("tuned_mae"), basic_fold.rename("basic_mae")], axis=1
+    ).dropna()
+    wins = int((paired_gate["tuned_mae"] < paired_gate["basic_mae"]).sum())
+    required_wins = 2 if options.mode == "full" else 1
+    gate_checks = {
+        "non_basic_configuration": selected_candidate.source != "basic_anchor",
+        "lower_mean_mae_than_basic_lstm": float(tuned_fold.mean()) < float(basic_fold.mean()),
+        "wins_required_fold_averages": wins >= required_wins,
+        "complete_search": len(results) == len(candidates) * len(folds) * len(seeds),
+    }
+    validation_gate_passed = bool(all(gate_checks.values()))
+    gate_bypassed_for_smoke = options.mode == "smoke"
+    gate_path = paths.models / f"focused_lstm_validation_gate{suffix}.json"
+    write_json_atomic(
+        gate_path,
+        {
+            "passed": validation_gate_passed,
+            "bypassed_for_smoke": gate_bypassed_for_smoke,
+            "checks": gate_checks,
+            "selected_candidate": selected_candidate.candidate_id,
+            "selected_source": selected_candidate.source,
+            "selected_mean_mae": float(tuned_fold.mean()),
+            "basic_lstm_mean_mae": float(basic_fold.mean()),
+            "fold_wins": wins,
+            "required_fold_wins": required_wins,
+            "paired_fold_metrics": paired_gate.reset_index().to_dict(orient="records"),
+            "source_fingerprint": store.source_fingerprint,
+        },
+    )
+    if options.mode == "full" and not validation_gate_passed:
+        failed = [name for name, passed in gate_checks.items() if not passed]
+        raise RuntimeError(
+            "Focused tuned-LSTM validation gate failed before benchmark access: "
+            + ", ".join(failed)
+        )
+
     selected_results = results[results["candidate_id"].eq(selected_candidate.candidate_id)]
     epoch_budget = int(max(1, np.ceil(selected_results["best_epoch"].median())))
     best_path = paths.models / f"best_hyperparameters{suffix}.json"
@@ -1064,16 +1336,19 @@ def tune_stage(
             "architecture": "lstm",
             "objective": "mean_rolling_validation_mae",
             "values": selected_candidate.to_dict(),
+            "selected_feature_policy": selected_feature,
+            "selected_optimization_recipe": selected_recipe.to_dict(),
             "epoch_budget": epoch_budget,
-            "selection_rule": "one-standard-error; parameters, layers, direct formulation",
+            "selection_rule": "paired one-standard-error; parameters, layers, direct formulation",
             "run_mode": options.mode,
             "config_hash": options.stable_hash(),
             "source_fingerprint": store.source_fingerprint,
-            "selection_audit": audit,
+            "recipe_selection_audit": recipe_audit,
+            "candidate_selection_audit": candidate_audit,
         },
     )
 
-    model_table, feature_columns, sequences = _load_model_inputs(
+    model_table, feature_columns, _ = _load_model_inputs(
         options, paths, splits=("train",)
     )
     _, _, _, preprocessor_path = _model_input_paths(paths, suffix)
@@ -1084,11 +1359,19 @@ def tune_stage(
         (selected_lookback, len(feature_columns)),
         artifacts,
     )
+    final_sequences = build_sequences(
+        model_table,
+        feature_columns,
+        selected_lookback,
+        selected_candidate.batch_size,
+        CONFIG.seed,
+        splits=("train",),
+    )
     final_checkpoint = paths.models / f"tuned_final{suffix}.keras"
     final_history = paths.histories / f"tuned_final{suffix}_epochs.csv"
     model, training_seconds, _ = _train_final_model(
         model,
-        sequences["train"],
+        final_sequences["train"],
         epochs=epoch_budget,
         checkpoint=final_checkpoint,
         history_path=final_history,
@@ -1105,23 +1388,45 @@ def tune_stage(
             "selection_metric": "mean_rolling_validation_mae",
             "mean_validation_mae": float(selected_row["mean_mae"]),
             "validation_standard_error": float(selected_row["se_mae"]),
+            "selected_feature_policy": selected_feature,
+            "selected_optimization_recipe": selected_recipe.to_dict(),
             "final_checkpoint": str(final_checkpoint),
             "frozen_test_used_for_selection": False,
             "selection_locked_before_benchmark": True,
+            "validation_gate_passed": validation_gate_passed,
+            "validation_gate_bypassed_for_smoke": gate_bypassed_for_smoke,
             "run_mode": options.mode,
             "config_hash": options.stable_hash(),
             "source_fingerprint": store.source_fingerprint,
-            "selection_audit": audit,
+            "recipe_selection_audit": recipe_audit,
+            "candidate_selection_audit": candidate_audit,
         },
     )
-    outputs = [search_path, summary_path, best_path, final_checkpoint, final_history, final_selection_path]
+    outputs = [
+        recipe_path,
+        recipe_summary_path,
+        recipe_audit_path,
+        search_path,
+        summary_path,
+        candidate_audit_path,
+        gate_path,
+        best_path,
+        final_checkpoint,
+        final_history,
+        final_selection_path,
+    ]
     return {
         "architecture": "lstm",
+        "selected_feature_policy": selected_feature,
+        "selected_recipe": selected_recipe.candidate_id,
+        "recipe_validation_fits": len(recipe_results),
         "candidate_count": len(candidates),
         "validation_fits": len(results),
         "selected_candidate": selected_candidate.candidate_id,
         "formulation": selected_candidate.formulation,
         "validation_mae": float(selected_row["mean_mae"]),
+        "validation_gate_passed": validation_gate_passed,
+        "validation_gate_bypassed_for_smoke": gate_bypassed_for_smoke,
         "epoch_budget": epoch_budget,
         "training_seconds": training_seconds,
         "run_mode": options.mode,
@@ -1139,9 +1444,9 @@ def evaluate_stage(
     from tensorflow import keras
 
     # Import registers custom objects before loading any saved model.
-    from .models import PersistenceResidual, SerializableHuber
+    from .models import PersistenceResidual, SerializableHuber, SerializablePinball
 
-    del PersistenceResidual, SerializableHuber
+    del PersistenceResidual, SerializableHuber, SerializablePinball
 
     suffix = options.artifact_suffix
     required = [
@@ -1159,6 +1464,10 @@ def evaluate_stage(
         raise RuntimeError("The tuned model was produced in a different run mode.")
     if final_selection.get("source_fingerprint") != store.source_fingerprint:
         raise RuntimeError("The tuned model belongs to different methodology source.")
+    gate_passed = bool(final_selection.get("validation_gate_passed"))
+    smoke_bypass = bool(final_selection.get("validation_gate_bypassed_for_smoke"))
+    if not gate_passed and not (options.mode == "smoke" and smoke_bypass):
+        raise PermissionError("Frozen benchmark access requires a passed tuned-LSTM validation gate.")
     development = load_development_data(paths)
     benchmark = load_frozen_benchmark(
         paths,
@@ -1184,6 +1493,7 @@ def evaluate_stage(
         data_end_exclusive=CONFIG.data_end_exclusive,
         lookback_hours=selected_lookback,
         forward_fill_limit_hours=selected_preprocessing["forward_fill_limit_hours"],
+        feature_policy=selected_preprocessing["feature_policy"],
     )
     model_table, benchmark_metadata = transform_model_table(raw_evaluation, artifacts, policy)
     benchmark_model_path, benchmark_metadata_path = _benchmark_input_paths(paths, suffix)
@@ -1193,7 +1503,7 @@ def evaluate_stage(
         model_table,
         artifacts.feature_columns,
         selected_lookback,
-        options.batch_size,
+        int(final_selection["selected_candidate"]["batch_size"]),
         CONFIG.seed,
         splits=("test",),
     )
@@ -1370,11 +1680,15 @@ def evaluate_stage(
         & bootstrap_results["block_length_days"].eq(7)
     ].iloc[0]
     significant = bool(float(basic_bootstrap["ci95_upper"]) < 0)
+    observed_winner = str(overall_metrics.iloc[0]["model"])
+    tuned_is_winner = observed_winner == "tuned_final"
     claim_path = paths.assignment2_tables / f"optimization_claim{suffix}.json"
     write_json_atomic(
         claim_path,
         {
             "statistically_superior_to_basic_lstm": significant,
+            "tuned_is_observed_mae_winner": tuned_is_winner,
+            "observed_mae_winner": observed_winner,
             "rule": "claim superiority only when the paired seven-day moving-block CI is below zero",
             "official_block_length_days": 7,
             "sensitivity_block_length_days": 1,
@@ -1384,13 +1698,14 @@ def evaluate_stage(
         },
     )
     summary = {
-        "winner": str(overall_metrics.iloc[0]["model"]),
+        "winner": observed_winner,
         "winner_mae": float(overall_metrics.iloc[0]["mae"]),
         "tuned_mae": float(tuned["mae"]),
         "persistence_mae": float(persistence["mae"]),
         "improvement_over_persistence_percent": float(improvement),
         "test_anchors": len(base_frame),
         "statistically_superior_to_basic_lstm": significant,
+        "tuned_is_observed_mae_winner": tuned_is_winner,
         "run_mode": options.mode,
     }
     outputs = [

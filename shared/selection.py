@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
 ForecastFormulation = Literal["direct", "residual"]
+LossName = Literal["huber", "mae", "pinball"]
+OptimizerName = Literal["adam", "adamw"]
 
 
 @dataclass(frozen=True)
@@ -34,7 +36,7 @@ ROLLING_FOLDS = (
 
 @dataclass(frozen=True)
 class LSTMConfig:
-    """Serializable LSTM candidate used by the stratified random search."""
+    """Complete serializable architecture and optimization recipe."""
 
     candidate_id: str
     formulation: ForecastFormulation
@@ -45,64 +47,207 @@ class LSTMConfig:
     l2_strength: float
     num_layers: int
     huber_delta: float
-    source: str = "random"
+    loss_name: LossName = "huber"
+    pinball_tau: float = 0.5
+    optimizer_name: OptimizerName = "adam"
+    weight_decay: float = 0.0
+    clipnorm: float | None = None
+    use_ema: bool = False
+    ema_momentum: float = 0.99
+    batch_size: int = 256
+    source: str = "focused_local_search"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
-def generate_lstm_candidates(seed: int = 42, count: int = 16) -> list[LSTMConfig]:
-    """Return two anchors, six direct samples, and eight residual samples."""
+def generate_optimization_recipes() -> list[LSTMConfig]:
+    """Return the six preregistered candidate-13 optimization recipes."""
 
-    if count != 16:
-        raise ValueError("The full distinction search is defined for exactly 16 candidates.")
-    candidates = [
-        LSTMConfig("candidate_00", "direct", 64, 32, 0.2, 1e-3, 0.0, 1, 10.0, "basic_anchor"),
+    common = {
+        "formulation": "residual",
+        "units": 128,
+        "dense_units": 64,
+        "dropout": 0.2,
+        "learning_rate": 0.000559702206464,
+        "l2_strength": 1e-4,
+        "num_layers": 2,
+        "batch_size": 256,
+        "ema_momentum": 0.99,
+    }
+    return [
         LSTMConfig(
-            "candidate_01",
-            "direct",
-            128,
-            64,
-            0.2,
-            0.001074881542656793,
-            1e-4,
-            1,
-            10.0,
-            "previous_best_anchor",
+            "recipe_00",
+            huber_delta=5.0,
+            source="candidate13_reproduction",
+            **common,
+        ),
+        LSTMConfig(
+            "recipe_01",
+            huber_delta=5.0,
+            clipnorm=1.0,
+            use_ema=True,
+            source="adam_huber5_ema",
+            **common,
+        ),
+        LSTMConfig(
+            "recipe_02",
+            huber_delta=2.0,
+            clipnorm=1.0,
+            use_ema=True,
+            source="adam_huber2_ema",
+            **common,
+        ),
+        LSTMConfig(
+            "recipe_03",
+            huber_delta=2.0,
+            loss_name="mae",
+            clipnorm=1.0,
+            use_ema=True,
+            source="adam_mae_ema",
+            **common,
+        ),
+        LSTMConfig(
+            "recipe_04",
+            huber_delta=2.0,
+            loss_name="pinball",
+            pinball_tau=0.55,
+            clipnorm=1.0,
+            use_ema=True,
+            source="adam_pinball055_ema",
+            **common,
+        ),
+        LSTMConfig(
+            "recipe_05",
+            huber_delta=2.0,
+            optimizer_name="adamw",
+            weight_decay=1e-5,
+            clipnorm=1.0,
+            use_ema=True,
+            source="adamw_huber2_ema",
+            **common,
+        ),
+    ]
+
+
+def _apply_recipe(
+    recipe: LSTMConfig,
+    *,
+    candidate_id: str,
+    formulation: ForecastFormulation,
+    units: int,
+    dense_units: int,
+    dropout: float,
+    learning_rate: float,
+    l2_strength: float,
+    num_layers: int,
+    batch_size: int,
+    source: str,
+) -> LSTMConfig:
+    return replace(
+        recipe,
+        candidate_id=candidate_id,
+        formulation=formulation,
+        units=units,
+        dense_units=dense_units,
+        dropout=dropout,
+        learning_rate=learning_rate,
+        l2_strength=l2_strength,
+        num_layers=num_layers,
+        batch_size=batch_size,
+        source=source,
+    )
+
+
+def generate_lstm_candidates(
+    seed: int = 42,
+    count: int = 12,
+    recipe: LSTMConfig | None = None,
+) -> list[LSTMConfig]:
+    """Return two anchors and a balanced ten-candidate local search."""
+
+    if count != 12:
+        raise ValueError("The V2.2 focused search is defined for exactly 12 candidates.")
+    selected_recipe = recipe or generate_optimization_recipes()[0]
+    candidates = [
+        _apply_recipe(
+            selected_recipe,
+            candidate_id="candidate_00",
+            formulation="direct",
+            units=64,
+            dense_units=32,
+            dropout=0.2,
+            learning_rate=1e-3,
+            l2_strength=0.0,
+            num_layers=1,
+            batch_size=256,
+            source="basic_anchor",
+        ),
+        _apply_recipe(
+            selected_recipe,
+            candidate_id="candidate_01",
+            formulation="residual",
+            units=128,
+            dense_units=64,
+            dropout=0.2,
+            learning_rate=0.000559702206464,
+            l2_strength=1e-4,
+            num_layers=2,
+            batch_size=256,
+            source="candidate13_anchor",
         ),
     ]
     rng = np.random.default_rng(seed)
-    seen = {
-        (
-            item.formulation,
-            item.units,
-            item.dense_units,
-            item.dropout,
-            round(item.learning_rate, 12),
-            item.l2_strength,
-            item.num_layers,
-            item.huber_delta,
-        )
-        for item in candidates
-    }
-    formulations = ["direct"] * 6 + ["residual"] * 8
-    for formulation in formulations:
-        while True:
-            values = (
-                formulation,
-                int(rng.choice([64, 128])),
-                int(rng.choice([32, 64])),
-                float(rng.choice([0.1, 0.2, 0.3])),
-                float(np.exp(rng.uniform(np.log(3e-4), np.log(1.5e-3)))),
-                float(rng.choice([0.0, 1e-5, 1e-4])),
-                int(rng.choice([1, 2])),
-                float(rng.choice([5.0, 10.0, 20.0])),
+    formulations = np.asarray(["residual"] * 8 + ["direct"] * 2, dtype=object)
+    rng.shuffle(formulations)
+
+    def balanced(values: list[Any]) -> np.ndarray:
+        assigned = np.resize(np.asarray(values, dtype=object), 10)
+        rng.shuffle(assigned)
+        return assigned
+
+    units = balanced([64, 96, 128])
+    dense_units = balanced([32, 64])
+    dropouts = balanced([0.1, 0.2, 0.3])
+    l2_values = balanced([0.0, 1e-5, 1e-4])
+    layers = balanced([1, 2])
+    batch_sizes = balanced([128, 256])
+    log_edges = np.linspace(np.log(3e-4), np.log(9e-4), 11)
+    learning_rates = np.exp(
+        [rng.uniform(log_edges[index], log_edges[index + 1]) for index in range(10)]
+    )
+    rng.shuffle(learning_rates)
+    for index in range(10):
+        candidates.append(
+            _apply_recipe(
+                selected_recipe,
+                candidate_id=f"candidate_{index + 2:02d}",
+                formulation=formulations[index],
+                units=int(units[index]),
+                dense_units=int(dense_units[index]),
+                dropout=float(dropouts[index]),
+                learning_rate=float(learning_rates[index]),
+                l2_strength=float(l2_values[index]),
+                num_layers=int(layers[index]),
+                batch_size=int(batch_sizes[index]),
+                source="focused_local_search",
             )
-            key = (*values[:4], round(values[4], 12), *values[5:])
-            if key not in seen:
-                seen.add(key)
-                break
-        candidates.append(LSTMConfig(f"candidate_{len(candidates):02d}", *values))
+        )
+    keys = {
+        (
+            candidate.formulation,
+            candidate.units,
+            candidate.dense_units,
+            candidate.dropout,
+            round(candidate.learning_rate, 12),
+            candidate.l2_strength,
+            candidate.num_layers,
+            candidate.batch_size,
+        )
+        for candidate in candidates
+    }
+    if len(keys) != len(candidates):
+        raise RuntimeError("Focused candidate generation produced a duplicate configuration.")
     return candidates
 
 
@@ -161,6 +306,85 @@ def aggregate_validation_results(results: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values(["mean_mae", "parameters", "num_layers", "formulation"]).reset_index(drop=True)
 
 
+def paired_comparison_table(
+    results: pd.DataFrame,
+    *,
+    item_column: str = "candidate_id",
+) -> pd.DataFrame:
+    """Compare every item with the raw winner using paired fold-level errors."""
+
+    required = {item_column, "fold", "seed", "mae"}
+    missing = required - set(results.columns)
+    if missing:
+        raise ValueError(f"Paired results lack columns: {sorted(missing)}")
+    fold_means = (
+        results.groupby([item_column, "fold"], observed=True)["mae"]
+        .mean()
+        .rename("fold_mean_mae")
+        .reset_index()
+    )
+    counts = fold_means.groupby(item_column, observed=True)["fold"].nunique()
+    if counts.nunique() != 1:
+        raise ValueError("Paired selection requires the same folds for every item.")
+    pivot = fold_means.pivot(index="fold", columns=item_column, values="fold_mean_mae")
+    if pivot.isna().any().any():
+        raise ValueError("Paired selection requires a complete item-by-fold result matrix.")
+    mean_errors = pivot.mean(axis=0)
+    raw_winner = str(mean_errors.sort_values(kind="stable").index[0])
+    rows: list[dict[str, Any]] = []
+    for item in pivot.columns:
+        differences = pivot[item] - pivot[raw_winner]
+        paired_se = float(differences.std(ddof=1) / np.sqrt(len(differences))) if len(differences) > 1 else 0.0
+        mean_degradation = float(differences.mean())
+        rows.append(
+            {
+                item_column: item,
+                "raw_winner": raw_winner,
+                "mean_paired_degradation": mean_degradation,
+                "paired_standard_error": paired_se,
+                "paired_one_se_eligible": bool(mean_degradation <= paired_se + 1e-12),
+                "paired_folds": int(len(differences)),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(
+        ["mean_paired_degradation", item_column], kind="stable"
+    ).reset_index(drop=True)
+
+
+def select_paired_one_standard_error(
+    results: pd.DataFrame,
+    summary: pd.DataFrame,
+    *,
+    item_column: str = "candidate_id",
+    simplicity_columns: tuple[str, ...],
+    preference_columns: tuple[str, ...] = (),
+) -> tuple[pd.Series, pd.DataFrame, dict[str, Any]]:
+    """Select a simple model only when paired fold evidence supports equivalence."""
+
+    comparisons = paired_comparison_table(results, item_column=item_column)
+    ranked = summary.merge(comparisons, on=item_column, validate="one_to_one")
+    eligible = ranked.loc[ranked["paired_one_se_eligible"]].copy()
+    if eligible.empty:
+        raise RuntimeError("Paired one-standard-error selection produced no eligible item.")
+    sort_columns = [*simplicity_columns, *preference_columns, "mean_mae", item_column]
+    selected = eligible.sort_values(sort_columns, kind="stable").iloc[0]
+    raw_winner = str(comparisons.iloc[0]["raw_winner"])
+    audit = {
+        "raw_winner_by_mean_mae": raw_winner,
+        "selected_item": str(selected[item_column]),
+        "eligible_items": comparisons.loc[
+            comparisons["paired_one_se_eligible"], item_column
+        ].astype(str).tolist(),
+        "rule": (
+            "Average seeds within folds; compare each item with the raw winner; "
+            "accept equivalence only when mean paired degradation is no greater "
+            "than its fold-level paired standard error."
+        ),
+        "tie_break_columns": [*simplicity_columns, *preference_columns],
+    }
+    return selected, comparisons, audit
+
+
 def validate_search_completeness(
     results: pd.DataFrame,
     candidate_ids: Iterable[str],
@@ -202,26 +426,6 @@ def validate_search_completeness(
     return filtered.sort_values(["candidate_id", "fold", "seed"], kind="stable").reset_index(drop=True)
 
 
-def selection_audit(summary: pd.DataFrame, selected: pd.Series) -> dict[str, Any]:
-    """Return the threshold, eligible candidates, and deterministic tie rationale."""
-
-    best = summary.sort_values("mean_mae", kind="stable").iloc[0]
-    threshold = float(best["mean_mae"] + best["se_mae"])
-    eligible = summary.loc[summary["mean_mae"] <= threshold, "candidate_id"].astype(str).tolist()
-    return {
-        "best_candidate_by_mean_mae": str(best["candidate_id"]),
-        "best_mean_mae": float(best["mean_mae"]),
-        "best_fold_level_standard_error": float(best["se_mae"]),
-        "one_standard_error_threshold": threshold,
-        "eligible_candidates": eligible,
-        "selected_candidate": str(selected["candidate_id"]),
-        "tie_break_reason": (
-            "Among candidates within one fold-level standard error, prefer fewer parameters, "
-            "then fewer LSTM layers, then direct forecasting."
-        ),
-    }
-
-
 def select_one_standard_error(
     summary: pd.DataFrame,
     *,
@@ -239,12 +443,17 @@ def select_one_standard_error(
     return eligible.sort_values(sort_columns, kind="stable").iloc[0]
 
 
-def select_lstm_candidate(summary: pd.DataFrame) -> pd.Series:
-    """Select within one SE, preferring parameters, layers, then direct form."""
+def select_lstm_candidate(
+    results: pd.DataFrame,
+    summary: pd.DataFrame,
+) -> tuple[pd.Series, pd.DataFrame, dict[str, Any]]:
+    """Use paired fold evidence, then parameters, layers, and direct form."""
 
     ranked = summary.copy()
     ranked["formulation_rank"] = ranked["formulation"].map({"direct": 0, "residual": 1})
-    return select_one_standard_error(
+    return select_paired_one_standard_error(
+        results,
         ranked,
+        item_column="candidate_id",
         simplicity_columns=("parameters", "num_layers", "formulation_rank"),
     )

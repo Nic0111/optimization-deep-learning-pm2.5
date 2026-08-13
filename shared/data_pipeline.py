@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
@@ -23,6 +24,13 @@ from .config import (
     CONTINUOUS_INPUT_COLUMNS,
     EXPECTED_STATIONS,
     ProjectPaths,
+)
+
+FeaturePolicyName = Literal["base", "pm25_dynamics", "multivariate_dynamics"]
+FEATURE_POLICIES: tuple[FeaturePolicyName, ...] = (
+    "base",
+    "pm25_dynamics",
+    "multivariate_dynamics",
 )
 
 
@@ -45,12 +53,15 @@ class PreprocessingArtifacts:
 
     scaler: StandardScaler
     continuous_columns: list[str]
+    engineered_columns: list[str]
+    scaled_source_columns: list[str]
     scaled_columns: list[str]
     feature_columns: list[str]
     station_medians: dict[str, dict[str, float]]
     global_medians: dict[str, float]
     station_columns: list[str]
     forward_fill_limit_hours: int | None
+    feature_policy: FeaturePolicyName
     fit_start: str
     fit_end_exclusive: str
     methodology_version: str = CONFIG.methodology_version
@@ -68,6 +79,7 @@ class PreprocessingPolicy:
     data_end_exclusive: str = CONFIG.data_end_exclusive
     lookback_hours: int = CONFIG.lookback_hours
     forward_fill_limit_hours: int | None = CONFIG.forward_fill_limit_hours
+    feature_policy: FeaturePolicyName = "base"
 
 
 COMPASS_DEGREES = {
@@ -312,13 +324,76 @@ def _ordered_copy(raw_data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def _feature_contract() -> tuple[list[str], list[str], list[str]]:
-    scaled = [f"z__{column}" for column in CONTINUOUS_INPUT_COLUMNS]
+def engineered_feature_columns(feature_policy: FeaturePolicyName) -> list[str]:
+    """Return the ordered, serializable causal feature contract for one policy."""
+
+    if feature_policy not in FEATURE_POLICIES:
+        raise ValueError(f"Unknown feature policy: {feature_policy}")
+    if feature_policy == "base":
+        return []
+    columns = [f"PM2.5_delta_{lag}h" for lag in (1, 3, 6)]
+    for window in (3, 6, 12, 24):
+        columns.extend(
+            [
+                f"PM2.5_roll_mean_{window}h",
+                f"PM2.5_roll_std_{window}h",
+                f"PM2.5_minus_roll_mean_{window}h",
+            ]
+        )
+    if feature_policy == "multivariate_dynamics":
+        columns.extend(
+            f"{column}_delta_{lag}h"
+            for column in ("PM10", "SO2", "NO2", "CO", "O3")
+            for lag in (1, 3)
+        )
+    return columns
+
+
+def add_causal_dynamic_features(
+    data: pd.DataFrame,
+    feature_policy: FeaturePolicyName,
+) -> pd.DataFrame:
+    """Add station-local features that use only the current and preceding rows."""
+
+    result = data.copy()
+    if feature_policy == "base":
+        return result
+    if feature_policy not in FEATURE_POLICIES:
+        raise ValueError(f"Unknown feature policy: {feature_policy}")
+    pm25 = result.groupby("station", sort=False, observed=True)["PM2.5"]
+    for lag in (1, 3, 6):
+        result[f"PM2.5_delta_{lag}h"] = (result["PM2.5"] - pm25.shift(lag)).fillna(0.0)
+    for window in (3, 6, 12, 24):
+        rolling_mean = pm25.transform(
+            lambda values: values.rolling(window, min_periods=1).mean()
+        )
+        rolling_std = pm25.transform(
+            lambda values: values.rolling(window, min_periods=1).std(ddof=0)
+        )
+        result[f"PM2.5_roll_mean_{window}h"] = rolling_mean
+        result[f"PM2.5_roll_std_{window}h"] = rolling_std
+        result[f"PM2.5_minus_roll_mean_{window}h"] = result["PM2.5"] - rolling_mean
+    if feature_policy == "multivariate_dynamics":
+        for column in ("PM10", "SO2", "NO2", "CO", "O3"):
+            grouped = result.groupby("station", sort=False, observed=True)[column]
+            for lag in (1, 3):
+                result[f"{column}_delta_{lag}h"] = (result[column] - grouped.shift(lag)).fillna(0.0)
+    engineered = engineered_feature_columns(feature_policy)
+    result[engineered] = result[engineered].astype("float32")
+    return result
+
+
+def _feature_contract(
+    feature_policy: FeaturePolicyName,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    engineered = engineered_feature_columns(feature_policy)
+    scaled_sources = [*CONTINUOUS_INPUT_COLUMNS, *engineered]
+    scaled = [f"z__{column}" for column in scaled_sources]
     missing = [f"missing__{column}" for column in CONTINUOUS_INPUT_COLUMNS]
     temporal = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
     wind = ["wind_sin", "wind_cos", "wind_missing"]
     stations = [f"station__{station}" for station in EXPECTED_STATIONS]
-    return scaled, stations, scaled + missing + temporal + wind + stations
+    return scaled_sources, scaled, stations, scaled + missing + temporal + wind + stations
 
 
 def _causal_fill(
@@ -376,17 +451,23 @@ def fit_preprocessor(
         station_medians=station_medians,
         global_medians=global_medians,
     )
-    scaler = StandardScaler().fit(imputed_fit[continuous])
-    scaled_columns, station_columns, feature_columns = _feature_contract()
+    imputed_fit = add_causal_dynamic_features(imputed_fit, policy.feature_policy)
+    scaled_source_columns, scaled_columns, station_columns, feature_columns = _feature_contract(
+        policy.feature_policy
+    )
+    scaler = StandardScaler().fit(imputed_fit[scaled_source_columns])
     return PreprocessingArtifacts(
         scaler=scaler,
         continuous_columns=continuous,
+        engineered_columns=engineered_feature_columns(policy.feature_policy),
+        scaled_source_columns=scaled_source_columns,
         scaled_columns=scaled_columns,
         feature_columns=feature_columns,
         station_medians=station_medians,
         global_medians=global_medians,
         station_columns=station_columns,
         forward_fill_limit_hours=policy.forward_fill_limit_hours,
+        feature_policy=policy.feature_policy,
         fit_start=policy.train_start,
         fit_end_exclusive=policy.fit_end_exclusive,
         source_fingerprint=source_fingerprint,
@@ -402,6 +483,8 @@ def transform_model_table(
 
     if artifacts.methodology_version != CONFIG.methodology_version:
         raise RuntimeError("The fitted preprocessor belongs to a different methodology version.")
+    if artifacts.feature_policy != policy.feature_policy:
+        raise RuntimeError("The fitted preprocessor belongs to a different feature policy.")
     data = _ordered_copy(raw_data)
     data["PM2.5_target_original"] = data["PM2.5"]
     for column in CONTINUOUS_INPUT_COLUMNS:
@@ -413,6 +496,7 @@ def transform_model_table(
         global_medians=artifacts.global_medians,
     )
     data["PM2.5_input_raw"] = data["PM2.5"]
+    data = add_causal_dynamic_features(data, artifacts.feature_policy)
 
     wind_missing = data["wd"].isna() | ~data["wd"].isin(COMPASS_DEGREES)
     wind_radians = np.deg2rad(data["wd"].map(COMPASS_DEGREES).fillna(0.0).astype(float))
@@ -428,7 +512,7 @@ def transform_model_table(
     for station, column in zip(EXPECTED_STATIONS, artifacts.station_columns, strict=True):
         data[column] = data["station"].eq(station).astype("float32")
     data[artifacts.scaled_columns] = artifacts.scaler.transform(
-        data[artifacts.continuous_columns]
+        data[artifacts.scaled_source_columns]
     ).astype("float32")
 
     data["target_pm25"] = data.groupby("station", sort=False, observed=True)[
@@ -481,6 +565,8 @@ def transform_model_table(
         "lookback_hours": policy.lookback_hours,
         "forward_fill_limit_hours": artifacts.forward_fill_limit_hours,
         "forecast_horizon": CONFIG.forecast_horizon,
+        "feature_policy": artifacts.feature_policy,
+        "engineered_features": artifacts.engineered_columns,
         "feature_count": len(artifacts.feature_columns),
         "features": artifacts.feature_columns,
         "split_counts": split_counts,
@@ -508,6 +594,7 @@ def create_model_table(
     data_end_exclusive: str = CONFIG.data_end_exclusive,
     lookback_hours: int = CONFIG.lookback_hours,
     forward_fill_limit_hours: int | None = CONFIG.forward_fill_limit_hours,
+    feature_policy: FeaturePolicyName = "base",
     persist: bool = True,
     source_fingerprint: str | None = None,
 ) -> tuple[pd.DataFrame, PreprocessingArtifacts, dict]:
@@ -521,6 +608,7 @@ def create_model_table(
         data_end_exclusive=data_end_exclusive,
         lookback_hours=lookback_hours,
         forward_fill_limit_hours=forward_fill_limit_hours,
+        feature_policy=feature_policy,
     )
     artifacts = fit_preprocessor(raw_data, policy, source_fingerprint=source_fingerprint)
     data, metadata = transform_model_table(raw_data, artifacts, policy)
@@ -528,7 +616,12 @@ def create_model_table(
         joblib.dump(artifacts, paths.preprocessor_file)
         _write_json(
             paths.feature_metadata,
-            {"features": artifacts.feature_columns, "count": len(artifacts.feature_columns)},
+            {
+                "features": artifacts.feature_columns,
+                "count": len(artifacts.feature_columns),
+                "feature_policy": artifacts.feature_policy,
+                "engineered_features": artifacts.engineered_columns,
+            },
         )
         _write_json(paths.split_metadata, metadata)
     return data, artifacts, metadata
@@ -572,6 +665,10 @@ def load_frozen_benchmark(
     selection = json.loads(final_selection_path.read_text(encoding="utf-8"))
     if not selection.get("selection_locked_before_benchmark"):
         raise PermissionError("The final model-selection record is not benchmark-locked.")
+    if not selection.get("validation_gate_passed") and not selection.get(
+        "validation_gate_bypassed_for_smoke"
+    ):
+        raise PermissionError("Frozen benchmark access requires a passed validation gate.")
     if expected_source_fingerprint is not None:
         recorded = selection.get("source_fingerprint")
         if recorded != expected_source_fingerprint:
