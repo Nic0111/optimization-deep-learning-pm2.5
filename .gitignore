@@ -203,6 +203,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Windows download security metadata copied into WSL
+*:Zone.Identifier
+
 # Ruff stuff:
 .ruff_cache/
 
