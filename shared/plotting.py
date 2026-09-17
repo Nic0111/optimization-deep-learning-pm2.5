@@ -24,15 +24,17 @@ def save_figure(path: Path) -> None:
 
 
 def plot_history(history: pd.DataFrame, path: Path, title: str) -> None:
-    """Plot training and validation MAE and loss."""
+    """Plot training metrics, including validation only when values exist."""
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(history.index + 1, history["mae"], label="train")
-    axes[0].plot(history.index + 1, history["val_mae"], label="validation")
+    if "val_mae" in history and history["val_mae"].notna().any():
+        axes[0].plot(history.index + 1, history["val_mae"], label="validation")
     axes[0].set(title="MAE", xlabel="Epoch", ylabel="MAE")
     axes[0].legend()
     axes[1].plot(history.index + 1, history["loss"], label="train")
-    axes[1].plot(history.index + 1, history["val_loss"], label="validation")
+    if "val_loss" in history and history["val_loss"].notna().any():
+        axes[1].plot(history.index + 1, history["val_loss"], label="validation")
     axes[1].set(title="Huber loss", xlabel="Epoch", ylabel="Loss")
     axes[1].legend()
     fig.suptitle(title)
