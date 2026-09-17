@@ -57,7 +57,7 @@ def plot_station_mae(metrics: pd.DataFrame, path: Path) -> None:
     ordered = metrics.sort_values("mae", ascending=True)
     plt.figure(figsize=(9, 5))
     sns.barplot(data=ordered, x="mae", y="station", color="#3b82f6")
-    plt.title("Test MAE by monitoring station")
+    plt.title("Benchmark MAE by monitoring station")
     plt.xlabel("MAE (µg/m³)")
     plt.ylabel("Station")
     save_figure(path)
